@@ -7,6 +7,8 @@
 
 import base64
 import json
+import yaml
+import re
 
 import pytest
 import requests
@@ -14,7 +16,8 @@ import urllib3
 from botocore.exceptions import BotoCoreError, ClientError
 from packaging.version import Version
 
-from test.alternator.util import random_bytes
+from test.alternator.util import random_bytes, is_aws
+from pathlib import Path
 
 
 def gen_json(n):
@@ -338,3 +341,49 @@ def test_base64_malformed_cond_expr(dynamodb, test_table_b):
             "begins_with(:v, c)"]:
         r = scan_with_binary_data_in_cond_expr(dynamodb, test_table_b, exp, exp_attr)
         assert r.status_code == 400, "Failed on expression \"%s\"" % (exp)
+
+# Parametrize test with data read from file 'test_manual_requests/<test_function_name>.yaml'
+def pytest_generate_tests(metafunc):
+    if 'test_filedata' in metafunc.fixturenames:
+        path = Path(metafunc.module.__file__)
+        path = path.parent / path.stem / (metafunc.function.__name__ + ".yaml")
+        with open(path) as stream:
+            test_data = yaml.safe_load(stream)
+            if test_data:
+                idlist = []
+                for test in test_data:
+                    idlist.append(test["id"] if "id" in test else None)
+                metafunc.parametrize('test_filedata', test_data, ids=idlist)
+
+# Tests invalid payload (but in valid JSON) from file 'test_manual_requests/test_invalid_request.yaml'
+# Each test case defines target function ('request') and JSON payload ('body').
+# It expects ValidationExceptions or SerializationException returned. It specifically checks it is not a fallback from assert.
+# Optionally test may define list of acceptable patterns ('message'), that error message should contain.
+@pytest.mark.xfail(reason="issue #23879")
+@pytest.mark.veryslow # Due to large number of cases
+def test_automated_invalid_payload(dynamodb, test_table, test_filedata):
+    body = test_filedata["body"]
+    body = (body if isinstance(body, str) else json.dumps(body)).replace("__TABLE__", test_table.name).replace("__ATTR__", "p")
+    req = get_signed_request(dynamodb, test_filedata["request"], body)
+    response = requests.post(req.url, headers=req.headers, data=req.body, verify=False)
+    assert "assert" not in response.text
+    r = json.loads(response.text)
+    assert 'ValidationException' in r['__type'] or "SerializationException" in r['__type']
+    if "message" in test_filedata: # not generated yet
+        # DynamoDB has inconsistent cases
+        m = r['Message'] if is_aws(dynamodb) and 'Message' in r else r['message']
+        flag = re.IGNORECASE if is_aws(dynamodb) else 0
+        expect = test_filedata["message"]
+        expect = [expect] if isinstance(expect, str) else expect
+        assert any([re.search(pattern, m, flag) for pattern in expect])
+
+@pytest.mark.xfail(reason="issue #23879")
+@pytest.mark.veryslow 
+def test_automated_valid_payload(dynamodb, test_table, test_filedata):
+    body = test_filedata["body"]
+    body = (body if isinstance(body, str) else json.dumps(body)).replace("__TABLE__", test_table.name).replace("__ATTR__", "p")
+    req = get_signed_request(dynamodb, test_filedata["request"], body)
+    response = requests.post(req.url, headers=req.headers, data=req.body, verify=False)
+    assert "assert" not in response.text
+    r = json.loads(response.text)
+    assert '__type' not in r

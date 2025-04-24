@@ -1,0 +1,54 @@
+- id: ListTables-ExclusiveStartTableName-TableName-unexpected_null
+  request: ListTables
+  body: '{"ExclusiveStartTableName": null}'
+- id: ListTables-Limit-ListTablesInputLimit-unexpected_null
+  request: ListTables
+  body: '{"Limit": null}'
+- id: Scan-IndexName-IndexName-unexpected_null
+  request: Scan
+  body: '{"TableName": "__TABLE__", "IndexName": null}'
+- id: Scan-AttributesToGet-AttributeNameList-unexpected_null
+  request: Scan
+  body: '{"TableName": "__TABLE__", "AttributesToGet": null}'
+- id: Scan-AttributesToGet-AttributeName-invalid_attr_name
+  request: Scan
+  body: '{"TableName": "__TABLE__", "AttributesToGet": ["$*"]}'
+- id: Scan-Limit-PositiveIntegerObject-unexpected_null
+  request: Scan
+  body: '{"TableName": "__TABLE__", "Limit": null}'
+- id: Scan-Select-Select-unexpected_null
+  request: Scan
+  body: '{"TableName": "__TABLE__", "Select": null}'
+- id: Scan-ScanFilter-FilterConditionMap-unexpected_null
+  request: Scan
+  body: '{"TableName": "__TABLE__", "ScanFilter": null}'
+- id: Scan-ConditionalOperator-ConditionalOperator-unexpected_null
+  request: Scan
+  body: '{"TableName": "__TABLE__", "ConditionalOperator": null}'
+- id: Scan-ExclusiveStartKey-Key-unexpected_null
+  request: Scan
+  body: '{"TableName": "__TABLE__", "ExclusiveStartKey": null}'
+- id: Scan-ReturnConsumedCapacity-ReturnConsumedCapacity-unexpected_null
+  request: Scan
+  body: '{"TableName": "__TABLE__", "ReturnConsumedCapacity": null}'
+- id: Scan-TotalSegments-ScanTotalSegments-unexpected_null
+  request: Scan
+  body: '{"TableName": "__TABLE__", "TotalSegments": null}'
+- id: Scan-Segment-ScanSegment-unexpected_null
+  request: Scan
+  body: '{"TableName": "__TABLE__", "Segment": null}'
+- id: Scan-ProjectionExpression-ProjectionExpression-unexpected_null
+  request: Scan
+  body: '{"TableName": "__TABLE__", "ProjectionExpression": null}'
+- id: Scan-FilterExpression-ConditionExpression-unexpected_null
+  request: Scan
+  body: '{"TableName": "__TABLE__", "FilterExpression": null}'
+- id: Scan-ExpressionAttributeNames-ExpressionAttributeNameMap-unexpected_null
+  request: Scan
+  body: '{"TableName": "__TABLE__", "ExpressionAttributeNames": null}'
+- id: Scan-ExpressionAttributeValues-ExpressionAttributeValueMap-unexpected_null
+  request: Scan
+  body: '{"TableName": "__TABLE__", "ExpressionAttributeValues": null}'
+- id: Scan-ConsistentRead-ConsistentRead-unexpected_null
+  request: Scan
+  body: '{"TableName": "__TABLE__", "ConsistentRead": null}'
