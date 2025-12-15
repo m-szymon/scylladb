@@ -7,6 +7,8 @@
  */
 
 #include "cql3/expr/expression.hh"
+#include "types/types.hh"
+#include "utils/rjson.hh"
 #include "vector_search/vector_store_client.hh"
 #include "utils.hh"
 #include "vs_mock_server.hh"
@@ -18,6 +20,7 @@
 #include "exceptions/exceptions.hh"
 #include "cql3/statements/select_statement.hh"
 #include "test/lib/cql_test_env.hh"
+#include "test/lib/cql_assertions.hh"
 #include "test/lib/log.hh"
 #include <cstdio>
 #include <functional>
@@ -36,6 +39,7 @@
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/short_streams.hh>
 #include <seastar/net/tcp.hh>
+#include <tuple>
 #include <variant>
 #include <vector>
 #include <filesystem>
@@ -1151,4 +1155,89 @@ SEASTAR_TEST_CASE(vector_store_client_abort_due_to_query_timeout) {
             .finally(seastar::coroutine::lambda([&] -> future<> {
                 co_await server->stop();
             }));
+}
+
+
+inline auto create_test_table_with_data(cql_test_env& env, const seastar::sstring& ks, const seastar::sstring& cf, int rows) -> future<schema_ptr> {
+    auto ret = co_await create_test_table(env, ks, cf);
+    for (int i = 1; i <= rows; i++) {
+        co_await env.execute_cql(fmt::format(R"(
+            insert into {}.{} (pk1, pk2, ck1, ck2, embedding)
+            values ({}, {}, {}, {}, [{}, {}, {}])
+        )",
+            ks, cf,
+            4*i, 4*i-1, 4*i-2, 4*i-3,
+            100.0f, 100.0f, 100.0f / float(i)));
+    }
+    co_return ret;
+}
+
+sstring to_vs_response(std::vector<std::tuple<int8_t, int8_t, int8_t, int8_t, float>> resp) {
+    auto arr = [&](auto get) {
+        std::string s = "[";
+        for (size_t i = 0; i < resp.size(); ++i) {
+            s += get(resp[i]);
+            if (i + 1 < resp.size()) s += ",";
+        }
+        s += "]";
+        return s;
+    };
+    std::string out = "{";
+    out += "\"primary_keys\":{";
+    out += "\"pk1\":" + arr([](const auto& t){ return std::to_string(std::get<0>(t)); }) + ",";
+    out += "\"pk2\":" + arr([](const auto& t){ return std::to_string(std::get<1>(t)); }) + ",";
+    out += "\"ck1\":" + arr([](const auto& t){ return std::to_string(std::get<2>(t)); }) + ",";
+    out += "\"ck2\":" + arr([](const auto& t){ return std::to_string(std::get<3>(t)); }) + "},";
+    out += "\"distances\":" + arr([](const auto& t){ return std::to_string(std::get<4>(t)); }) + "}";
+    return sstring(out);
+}
+std::vector<std::vector<bytes_opt>> to_cql_response(std::vector<std::tuple<int8_t, int8_t, int8_t, int8_t, float>> resp) {
+    std::vector<std::vector<bytes_opt>> cql_resp;
+    for (const auto& [pk1, pk2, ck1, ck2, distance] : resp) {
+        cql_resp.push_back({
+            byte_type->decompose(pk1),
+            byte_type->decompose(pk2),
+            byte_type->decompose(ck1),
+            byte_type->decompose(ck2),
+            //float_type->decompose(distance),
+        });
+    }
+    return cql_resp;
+}
+
+SEASTAR_TEST_CASE(vector_store_client_test_oversampling, *boost::unit_test::expected_failures(1)) {
+    auto server = co_await make_vs_mock_server();
+    auto cfg = make_config();
+    cfg.db_config->vector_store_primary_uri.set(format("http://good.authority.here:{}", server->port()));
+    co_await do_with_cql_env(
+            [&server](cql_test_env& env) -> future<> {
+                auto schema = co_await create_test_table_with_data(env, "ks", "test", 10);
+                auto as = abort_source_timeout();
+                auto& vs = env.local_qp().vector_store_client();
+                configure(vs).with_dns_refresh_interval(seconds(1)).with_dns({{"good.authority.here", "127.0.0.1"}});
+
+                vs.start_background_tasks();
+                auto result = co_await env.execute_cql("CREATE INDEX idx ON ks.test (embedding) USING 'vector_index' WITH OPTIONS={'rescoring_factor': '1.9'};");
+                
+                auto qo = std::make_unique<cql3::query_options>(db::consistency_level::LOCAL_ONE, std::vector<cql3::raw_value>{},
+                        cql3::query_options::specific_options{100, nullptr, {}, api::new_timestamp()});
+
+                // without quantization VS can fetch more vectors, but return only limit number of results
+                // verify that oversampling is requested: fetch = ceil(limit * rescoring_factor) = ceil(3 * 1.9) = 6
+                std::vector<std::tuple<int8_t, int8_t, int8_t, int8_t, float>> candidates = {{16,15,14,13,0.1}, {12,11,10,9,0.2}};
+                server->next_ann_response({status_type::ok, to_vs_response(candidates)});
+                auto msg = co_await env.execute_cql("SELECT pk1, pk2, ck1, ck2 FROM ks.test ORDER BY embedding ANN OF [0.1, 0.2, 0.3] LIMIT 3;", std::move(qo));
+                BOOST_REQUIRE(!server->ann_requests().empty());
+                auto request = rjson::parse(server->ann_requests().back().body);
+                //BOOST_REQUIRE_EQUAL(3, request["limit"].GetInt());
+                //BOOST_REQUIRE_EQUAL(6, request["fetch"].GetInt());
+                assert_that(msg).is_rows().with_size(2);
+                assert_that(msg).is_rows().with_rows(to_cql_response(candidates));
+
+
+            },
+            cfg)
+            .finally([&server] {
+                return server->stop();
+            });
 }
