@@ -2383,6 +2383,14 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
                      ? selection::selection::wildcard(schema)
                      : selection::selection::from_selectors(db, schema, keyspace(), levellized_prepared_selectors);
 
+    // in schema find column by name: "ALWAYS_FETCH"
+    // if found - add it to selection to always fetch it
+    const column_definition* always_fetch_col = schema->get_column_definition(bytes("ALWAYS_FETCH"));
+    if (always_fetch_col != nullptr) {
+        logger.info("Adding ALWAYS_FETCH column to selection");
+        selection->add_column_for_post_processing(*always_fetch_col);
+    }
+
     if (is_ann_query && hide_last_column) {
         // Hide the similarity selector from the client by reducing column_count
         selection->get_result_metadata()->hide_last_column();
