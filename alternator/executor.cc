@@ -15,6 +15,7 @@
 #include "cdc/log.hh"
 #include "cdc/cdc_options.hh"
 #include "auth/service.hh"
+#include "cql3/cql3_type.hh"
 #include "db/config.hh"
 #include "db/view/view_build_status.hh"
 #include "locator/tablets.hh"
@@ -63,6 +64,8 @@
 #include "types/types.hh"
 #include "db/system_keyspace.hh"
 #include "cql3/statements/ks_prop_defs.hh"
+#include "cql3/statements/index_target.hh"
+#include "index/secondary_index.hh"
 #include "alternator/ttl_tag.hh"
 
 using namespace std::chrono_literals;
@@ -407,14 +410,14 @@ static bool valid_table_name_chars(std::string_view name) {
 // can contain only the following characters: a-z, A-Z, 0-9, _ (underscore),
 // - (dash), . (dot)". However, Alternator only allows max_table_name_length
 // characters (see above) - not 255.
-static void validate_table_name(std::string_view name) {
+static void validate_table_name(std::string_view name, const char* source="TableName") {
     if (name.length() < 3 || name.length() > max_table_name_length) {
         throw api_error::validation(
-                format("TableName must be at least 3 characters long and at most {} characters long", max_table_name_length));
+                format("{} must be at least 3 characters long and at most {} characters long", source, max_table_name_length));
     }
     if (!valid_table_name_chars(name)) {
         throw api_error::validation(
-                "TableName must satisfy regular expression pattern: [a-zA-Z0-9_.-]+");
+                format("{} must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", source));
     }
 }
 
@@ -434,7 +437,7 @@ static void validate_cdc_log_name_length(std::string_view table_name) {
         // length. To provide a more helpful error message, we assume that
         // cdc::log_name() always adds a suffix of the same length.
         int suffix_len = cdc::log_name(table_name).length() - table_name.length();
-        throw api_error::validation(fmt::format("Streams cannot be enabled to a table whose name is longer than {} characters: {}",
+        throw api_error::validation(fmt::format("Streams or vector search cannot be enabled on a table whose name is longer than {} characters: {}",
             max_auxiliary_table_name_length - suffix_len, table_name));
     }
 }
@@ -1819,6 +1822,84 @@ future<executor::request_return_type> executor::create_table_on_shard0(service::
             unused_attribute_definitions));
     }
 
+    // Parse VectorIndexes parameters and apply them to "builder". This all
+    // happens before we actually creating the table, so if we have a parse
+    // errors we can still fail without creating any table.
+    const rjson::value* vector_indexes = rjson::find(request, "VectorIndexes");
+    if (vector_indexes) {
+        if (!vector_indexes->IsArray()) {
+            co_return api_error::validation("VectorIndexes must be an array.");
+        }
+        std::unordered_set<std::string> seen_attribute_names;
+        for (const rjson::value& v : vector_indexes->GetArray()) {
+            const rjson::value* index_name_v = rjson::find(v, "IndexName");
+            if (!index_name_v || !index_name_v->IsString()) {
+                co_return api_error::validation("VectorIndexes IndexName must be a string.");
+            }
+            std::string_view index_name = rjson::to_string_view(*index_name_v);
+            // Limit the length and character choice of a vector index's
+            // name to the same rules as table names. This is slightly
+            // different from GSI/LSI names, where we limit not the length
+            // of the index name but its sum with the base table name.
+            validate_table_name(index_name, "VectorIndexes IndexName");
+            if (!index_names.emplace(index_name).second) {
+                co_return api_error::validation(fmt::format("Duplicate IndexName '{}', ", index_name));
+            }
+            const rjson::value* vector_attribute_v = rjson::find(v, "VectorAttribute");
+            if (!vector_attribute_v || !vector_attribute_v->IsObject()) {
+                co_return api_error::validation("VectorIndexes VectorAttribute must be an object.");
+            }
+            const rjson::value* attribute_name_v = rjson::find(*vector_attribute_v, "AttributeName");
+            if (!attribute_name_v || !attribute_name_v->IsString()) {
+                co_return api_error::validation("VectorIndexes AttributeName must be a string.");
+            }
+            std::string_view attribute_name = rjson::to_string_view(*attribute_name_v);
+            validate_attr_name_length("VectorIndexes", attribute_name.size(), /*is_key=*/false, "AttributeName ");
+            if (!seen_attribute_names.emplace(attribute_name).second) {
+                co_return api_error::validation(fmt::format("Duplicate vector index on the same AttributeName '{}'", attribute_name));
+            }
+            // attribute_name must not be one of the key columns of the base
+            // or GSIs or LSIs, because those have mandatory types (defined in
+            // AttributeDefinitions) which will never be a vector.
+            for (auto it = attribute_definitions->Begin(); it != attribute_definitions->End(); ++it) {
+                if (rjson::to_string_view((*it)["AttributeName"]) == attribute_name) {
+                    co_return api_error::validation(fmt::format(
+                        "VectorIndexes AttributeName '{}' is a key column of type {} so cannot be used as a vector index target.", attribute_name, rjson::to_string_view((*it)["AttributeType"])));
+                }
+            }
+            const rjson::value* dimensions_v = rjson::find(*vector_attribute_v, "Dimensions");
+            if (!dimensions_v || !dimensions_v->IsInt() || dimensions_v->GetInt() <= 0 || (vector_dimension_t)dimensions_v->GetInt() > cql3::cql3_type::MAX_VECTOR_DIMENSION) {
+                co_return api_error::validation(fmt::format("VectorIndexes Dimensions must be an integer between 1 and {}.", cql3::cql3_type::MAX_VECTOR_DIMENSION));
+            }
+            int dimensions = dimensions_v->GetInt();
+            // The optional Projection parameter is only supported with
+            // ProjectionType=KEYS_ONLY. Other values are not yet supported.
+            const rjson::value* projection_v = rjson::find(v, "Projection");
+            if (projection_v) {
+                if (!projection_v->IsObject()) {
+                    co_return api_error::validation("VectorIndexes Projection must be an object.");
+                }
+                const rjson::value* projection_type_v = rjson::find(*projection_v, "ProjectionType");
+                if (!projection_type_v || !projection_type_v->IsString() ||
+                        rjson::to_string_view(*projection_type_v) != "KEYS_ONLY") {
+                    co_return api_error::validation("VectorIndexes Projection: only ProjectionType=KEYS_ONLY is currently supported.");
+                }
+            }
+            // Add a vector index metadata entry to the base table schema.
+            index_options_map index_options;
+            index_options[db::index::secondary_index::custom_class_option_name] = "vector_index";
+            index_options[cql3::statements::index_target::target_option_name] = sstring(attribute_name);
+            index_options["dimensions"] = std::to_string(dimensions);
+            builder.with_index(index_metadata{sstring(index_name), index_options,
+                    index_metadata_kind::custom, index_metadata::is_local_index(false)});
+        }
+        // If we have any vector indexes, we will use CDC and the CDC log
+        // name will need to fit our length limits, so validate it now.
+        if (vector_indexes->Size() > 0) {
+            validate_cdc_log_name_length(builder.cf_name());
+        }
+    }
+
     // We don't yet support configuring server-side encryption (SSE) via the
     // SSESpecifiction attribute, but an SSESpecification with Enabled=false
     // is simply the default, and should be accepted:
@@ -1888,6 +1969,13 @@ future<executor::request_return_type> executor::create_table_on_shard0(service::
                     co_return api_error::validation("Streams not yet supported on a table using tablets (issue #23838). "
                     "If you want to use streams, create a table with vnodes by setting the tag 'system:initial_tablets' set to 'none'.");
                 }
+            }
+        }
+        // Vector indexes is a new feature that we decided to only support
+        // on tablets.
+        if (vector_indexes && vector_indexes->Size() > 0) {
+            if (!rs->uses_tablets()) {
+                co_return api_error::validation("Vector indexes are not supported on tables using vnodes.");
             }
         }
         // Creating an index in tablets mode requires the keyspace to be RF-rack-valid.
