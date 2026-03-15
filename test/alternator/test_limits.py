@@ -84,6 +84,29 @@ def test_limit_attribute_length_nonkey_bad(test_table_s):
             ExpressionAttributeNames={'#name': too_long_name},
             ExpressionAttributeValues={':val': 1})
 
+# Empty attribute name is also not allowed. Reproduces SCYLLADB-1069.
+# We have similar tests for empty keys in test_item.py::test_{put,update}_item_empty_key.
+def test_limit_attribute_length_nonkey_empty(test_table_s):
+    p = random_string()
+    with pytest.raises(ClientError, match='ValidationException.*Empty attribute name'):
+        test_table_s.put_item(Item={'p': p, '': 1})
+    with pytest.raises(ClientError, match='ValidationException.*Empty attribute name'):
+        test_table_s.get_item(Key={'p': p}, ProjectionExpression='#name',
+            ExpressionAttributeNames={'#name': ''})
+    with pytest.raises(ClientError, match='ValidationException.*Empty attribute name'):
+        test_table_s.get_item(Key={'p': p}, AttributesToGet=[''])
+    with pytest.raises(ClientError, match='ValidationException.*Empty attribute name'):
+        test_table_s.update_item(Key={'p': p}, AttributeUpdates={'': {'Value': 2, 'Action': 'PUT'}})
+    with pytest.raises(ClientError, match='ValidationException.*Empty attribute name'):
+        test_table_s.update_item(Key={'p': p}, UpdateExpression='SET #name = :val',
+            ExpressionAttributeNames={'#name': ''},
+            ExpressionAttributeValues={':val': 3})
+    with pytest.raises(ClientError, match='ValidationException.*Empty attribute name'):
+        test_table_s.update_item(Key={'p': p}, UpdateExpression='SET a = :val',
+            ConditionExpression='#name = :val',
+            ExpressionAttributeNames={'#name': ''},
+            ExpressionAttributeValues={':val': 1})
+
 # Attribute length test 3: Test that *key* (hash and range) attribute names
 # up to 255 characters are allowed. In the test below we'll see that larger
 # sizes aren't allowed.

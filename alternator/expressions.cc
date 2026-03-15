@@ -744,7 +744,7 @@ void validate_attr_name_length(std::string_view supplementary_context, size_t at
     constexpr const size_t DYNAMODB_NONKEY_ATTR_NAME_SIZE_MAX = 65535;
 
     const size_t max_length = is_key ? DYNAMODB_KEY_ATTR_NAME_SIZE_MAX : DYNAMODB_NONKEY_ATTR_NAME_SIZE_MAX;
-    if (attr_name_length > max_length) {
+    if (attr_name_length > max_length || attr_name_length == 0) {
         std::string error_msg;
         if (!error_msg_prefix.empty()) {
             error_msg += error_msg_prefix;
@@ -754,7 +754,11 @@ void validate_attr_name_length(std::string_view supplementary_context, size_t at
             error_msg += supplementary_context;
             error_msg += " - ";
         }
-        error_msg += fmt::format("Attribute name is too large, must be less than {} bytes", std::to_string(max_length + 1));
+        if (attr_name_length == 0) {
+            error_msg += "Empty attribute name";
+        } else {
+            error_msg += fmt::format("Attribute name is too large, must be less than {} bytes", std::to_string(max_length + 1));
+        }
         throw api_error::validation(error_msg);
     }
 }
