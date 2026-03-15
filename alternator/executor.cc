@@ -953,6 +953,38 @@ future<rjson::value> executor::fill_table_description(schema_ptr schema, table_s
                 rjson::add(table_description, "GlobalSecondaryIndexes", std::move(gsi_array));
             }
         }
+        // List vector indexes, if this table has any:
+        rjson::value vector_index_array = rjson::empty_array();
+        for (const index_metadata& im : schema->indices()) {
+            const auto& opts = im.options();
+            auto class_it = opts.find(db::index::secondary_index::custom_class_option_name);
+            if (class_it == opts.end() || class_it->second != "vector_index") {
+                continue;
+            }
+            rjson::value entry = rjson::empty_object();
+            rjson::add(entry, "IndexName", rjson::from_string(im.name()));
+            rjson::value vector_attribute = rjson::empty_object();
+            auto target_it = opts.find(cql3::statements::index_target::target_option_name);
+            if (target_it != opts.end()) {
+                rjson::add(vector_attribute, "AttributeName", rjson::from_string(target_it->second));
+            }
+            auto dims_it = opts.find("dimensions");
+            if (dims_it != opts.end()) {
+                try {
+                    rjson::add(vector_attribute, "Dimensions", std::stoi(dims_it->second));
+                } catch (const std::exception& e) {
+                    // This should never happen, because the dimensions option
+                    // is validated on index creation
+                    elogger.error("Unexpected non-integer dimensions value '{}' for vector index '{}'", dims_it->second, im.name());
+                }
+            }
+            rjson::add(entry, "VectorAttribute", std::move(vector_attribute));
+            rjson::push_back(vector_index_array, std::move(entry));
+        }
+        if (!vector_index_array.Empty()) {
+            rjson::add(table_description, "VectorIndexes", std::move(vector_index_array));
+        }
+
         // Use map built by describe_key_schema() for base and indexes to produce
         // AttributeDefinitions for all key columns:
         rjson::value attribute_definitions = rjson::empty_array();
