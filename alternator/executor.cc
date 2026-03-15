@@ -468,6 +468,10 @@ static std::string view_name(std::string_view table_name, std::string_view index
     return ret;
 }
 
+static std::string gsi_name(std::string_view table_name, std::string_view index_name, bool validate_len = true) {
+    return view_name(table_name, index_name, ":", validate_len);
+}
+
 static std::string lsi_name(std::string_view table_name, std::string_view index_name, bool validate_len = true) {
     return view_name(table_name, index_name, "!:", validate_len);
 }
@@ -2212,6 +2216,142 @@ future<executor::request_return_type> executor::update_table(client_state& clien
                 }
             }
 
+            // Support VectorIndexUpdates to add or delete a vector index,
+            // similar to GlobalSecondaryIndexUpdates above. We handle this
+            // before builder.build() so we can use builder directly.
+            rjson::value* vector_index_updates = rjson::find(request, "VectorIndexUpdates");
+            if (vector_index_updates) {
+                if (!vector_index_updates->IsArray()) {
+                    co_return api_error::validation("VectorIndexUpdates must be an array");
+                }
+                if (vector_index_updates->Size() > 1) {
+                    co_return api_error::limit_exceeded("VectorIndexUpdates only allows one index creation or deletion");
+                }
+            }
+            if (vector_index_updates && vector_index_updates->Size() == 1) {
+                empty_request = false;
+                if (!(*vector_index_updates)[0].IsObject() || (*vector_index_updates)[0].MemberCount() != 1) {
+                    co_return api_error::validation("VectorIndexUpdates array must contain one object with a Create or Delete operation");
+                }
+                auto it = (*vector_index_updates)[0].MemberBegin();
+                const std::string_view op = rjson::to_string_view(it->name);
+                if (!it->value.IsObject()) {
+                    co_return api_error::validation("VectorIndexUpdates entries must be objects");
+                }
+                const rjson::value* index_name_v = rjson::find(it->value, "IndexName");
+                if (!index_name_v || !index_name_v->IsString()) {
+                    co_return api_error::validation("VectorIndexUpdates operation must have IndexName");
+                }
+                std::string_view index_name = rjson::to_string_view(*index_name_v);
+                if (op == "Create") {
+                    if (!p.local().local_db().find_keyspace(tab->ks_name()).get_replication_strategy().uses_tablets()) {
+                        co_return api_error::validation("Vector indexes are not supported on tables using vnodes.");
+                    }
+                    validate_table_name(index_name, "VectorIndexUpdates IndexName");
+                    // Check for duplicate index name against existing vector indexes, GSIs and LSIs.
+                    for (const index_metadata& im : tab->indices()) {
+                        if (im.name() == index_name) {
+                            co_return api_error::validation(fmt::format(
+                                "Vector index {} already exists in table {}", index_name, tab->cf_name()));
+                        }
+                    }
+                    if (p.local().data_dictionary().has_schema(tab->ks_name(), gsi_name(tab->cf_name(), index_name, false)) ||
+                        p.local().data_dictionary().has_schema(tab->ks_name(), lsi_name(tab->cf_name(), index_name, false))) {
+                        co_return api_error::validation(fmt::format(
+                            "GSI or LSI {} already exists in table {}, cannot reuse the name for a vector index", index_name, tab->cf_name()));
+                    }
+                    const rjson::value* vector_attribute_v = rjson::find(it->value, "VectorAttribute");
+                    if (!vector_attribute_v || !vector_attribute_v->IsObject()) {
+                        co_return api_error::validation("VectorIndexUpdates Create VectorAttribute must be an object.");
+                    }
+                    const rjson::value* attribute_name_v = rjson::find(*vector_attribute_v, "AttributeName");
+                    if (!attribute_name_v || !attribute_name_v->IsString()) {
+                        co_return api_error::validation("VectorIndexUpdates Create AttributeName must be a string.");
+                    }
+                    std::string_view attribute_name = rjson::to_string_view(*attribute_name_v);
+                    validate_attr_name_length("VectorIndexUpdates", attribute_name.size(), /*is_key=*/false, "AttributeName ");
+                    // attribute_name must not be a key column of the base
+                    // table or any of its GSIs or LSIs, because those have
+                    // mandatory types (defined in AttributeDefinitions) which
+                    // will never be a vector.
+                    for (const column_definition& cdef : tab->primary_key_columns()) {
+                        if (cdef.name_as_text() == attribute_name) {
+                            co_return api_error::validation(fmt::format(
+                                "VectorIndexUpdates AttributeName '{}' is a key column and cannot be used as a vector index target.", attribute_name));
+                        }
+                    }
+                    for (const auto& view : p.local().data_dictionary().find_column_family(tab).views()) {
+                        for (const column_definition& cdef : view->primary_key_columns()) {
+                            if (cdef.name_as_text() == attribute_name) {
+                                co_return api_error::validation(fmt::format(
+                                    "VectorIndexUpdates AttributeName '{}' is a key column of a GSI or LSI and cannot be used as a vector index target.", attribute_name));
+                            }
+                        }
+                    }
+                    // attribute_name must not already be the target of an
+                    // existing vector index.
+                    for (const index_metadata& im : tab->indices()) {
+                        const auto& opts = im.options();
+                        auto class_it = opts.find(db::index::secondary_index::custom_class_option_name);
+                        if (class_it == opts.end() || class_it->second != "vector_index") {
+                            continue;
+                        }
+                        auto target_it = opts.find(cql3::statements::index_target::target_option_name);
+                        if (target_it != opts.end() && target_it->second == attribute_name) {
+                            co_return api_error::validation(fmt::format(
+                                "VectorIndexUpdates AttributeName '{}' is already the target of an existing vector index.", attribute_name));
+                        }
+                    }
+                    const rjson::value* dimensions_v = rjson::find(*vector_attribute_v, "Dimensions");
+                    if (!dimensions_v || !dimensions_v->IsInt() || dimensions_v->GetInt() <= 0 || (vector_dimension_t)dimensions_v->GetInt() > cql3::cql3_type::MAX_VECTOR_DIMENSION) {
+                        co_return api_error::validation(fmt::format("VectorIndexUpdates Dimensions must be an integer between 1 and {}.", cql3::cql3_type::MAX_VECTOR_DIMENSION));
+                    }
+                    int dimensions = dimensions_v->GetInt();
+                    // The optional Projection parameter is only supported with
+                    // ProjectionType=KEYS_ONLY. Other values are not yet supported.
+                    const rjson::value* projection_v = rjson::find(it->value, "Projection");
+                    if (projection_v) {
+                        if (!projection_v->IsObject()) {
+                            co_return api_error::validation("VectorIndexUpdates Projection must be an object.");
+                        }
+                        const rjson::value* projection_type_v = rjson::find(*projection_v, "ProjectionType");
+                        if (!projection_type_v || !projection_type_v->IsString() ||
+                                rjson::to_string_view(*projection_type_v) != "KEYS_ONLY") {
+                            co_return api_error::validation("VectorIndexUpdates Projection: only ProjectionType=KEYS_ONLY is currently supported.");
+                        }
+                    }
+                    // A vector index will use CDC on this table, so the CDC
+                    // log table name will need to fit our length limits
+                    validate_cdc_log_name_length(builder.cf_name());
+                    index_options_map index_options;
+                    index_options[db::index::secondary_index::custom_class_option_name] = "vector_index";
+                    index_options[cql3::statements::index_target::target_option_name] = sstring(attribute_name);
+                    index_options["dimensions"] = std::to_string(dimensions);
+                    builder.with_index(index_metadata{sstring(index_name), index_options,
+                            index_metadata_kind::custom, index_metadata::is_local_index(false)});
+                } else if (op == "Delete") {
+                    bool found = false;
+                    for (const index_metadata& im : tab->indices()) {
+                        const auto& opts = im.options();
+                        auto class_it = opts.find(db::index::secondary_index::custom_class_option_name);
+                        if (im.name() == index_name && class_it != opts.end() && class_it->second == "vector_index") {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        co_return api_error::resource_not_found(fmt::format(
+                            "No vector index {} in table {}", index_name, tab->cf_name()));
+                    }
+                    builder.without_index(sstring(index_name));
+                } else {
+                    // Update operation not yet supported, as we don't yet
+                    // have any updatable properties of vector indexes.
+                    co_return api_error::validation(fmt::format(
+                        "VectorIndexUpdates supports a Create or Delete operation, saw '{}'", op));
+                }
+            }
+
             schema = builder.build();
             std::vector<view_ptr> new_views;
             std::vector<std::string> dropped_views;
@@ -2344,7 +2484,7 @@ future<executor::request_return_type> executor::update_table(client_state& clien
             }
 
             if (empty_request) {
-                co_return api_error::validation("UpdateTable requires one of GlobalSecondaryIndexUpdates, StreamSpecification or BillingMode to be specified");
+                co_return api_error::validation("UpdateTable requires one of GlobalSecondaryIndexUpdates, VectorIndexUpdates, StreamSpecification or BillingMode to be specified");
             }
 
             co_await verify_permission(enforce_authorization, warn_authorization, client_state_other_shard.get(), schema, auth::permission::ALTER, e.local()._stats);
