@@ -153,8 +153,7 @@ def new_dynamodb_session(request, dynamodb, get_valid_alternator_role):
         conf = botocore.client.Config(parameter_validation=False)
         if request.config.getoption('aws'):
             return boto3.resource('dynamodb', config=conf)
-        if host.hostname == 'localhost':
-            conf = conf.merge(botocore.client.Config(retries={"max_attempts": 0}, read_timeout=300))
+        conf = conf.merge(botocore.client.Config(retries={"max_attempts": 0}, read_timeout=300))
         user, secret = get_valid_alternator_role(dynamodb.meta.client._endpoint.host, role=user)
         region_name = dynamodb.meta.client.meta.region_name
         return ses.resource('dynamodb', endpoint_url=dynamodb.meta.client._endpoint.host, verify=host.scheme != 'http',
