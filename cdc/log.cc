@@ -195,7 +195,7 @@ public:
         for (auto sp : cfms) {
             const auto& schema = *sp;
 
-            if (!schema.cdc_options().enabled()) {
+            if (!cdc_enabled(schema)) {
                 continue;
             }
 
