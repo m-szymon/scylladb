@@ -67,6 +67,7 @@
 #include "cql3/statements/index_target.hh"
 #include "index/secondary_index.hh"
 #include "alternator/ttl_tag.hh"
+#include "vector_search/vector_store_client.hh"
 
 using namespace std::chrono_literals;
 
@@ -317,6 +318,7 @@ executor::executor(gms::gossiper& gossiper,
          service::migration_manager& mm,
          db::system_distributed_keyspace& sdks,
          cdc::metadata& cdc_metadata,
+         vector_search::vector_store_client& vsc,
          smp_service_group ssg,
          utils::updateable_value<uint32_t> default_timeout_in_ms)
     : _gossiper(gossiper),
@@ -325,6 +327,7 @@ executor::executor(gms::gossiper& gossiper,
       _mm(mm),
       _sdks(sdks),
       _cdc_metadata(cdc_metadata),
+      _vsc(vsc),
       _enforce_authorization(_proxy.data_dictionary().get_config().alternator_enforce_authorization),
       _warn_authorization(_proxy.data_dictionary().get_config().alternator_warn_authorization),
       _ssg(ssg),
@@ -578,7 +581,7 @@ static schema_ptr try_get_internal_table(data_dictionary::database db, std::stri
 // a table or a materialized view from which to read, based on the TableName
 // and optional IndexName in the request. Only requests like Query and Scan
 // which allow IndexName should use this function.
-enum class table_or_view_type { base, lsi, gsi };
+enum class table_or_view_type { base, lsi, gsi, vector_index };
 static std::pair<schema_ptr, table_or_view_type>
 get_table_or_view(service::storage_proxy& proxy, const rjson::value& request) {
     table_or_view_type type = table_or_view_type::base;
@@ -3936,8 +3939,8 @@ static select_type parse_select(const rjson::value& request, table_or_view_type 
     const rjson::value* select_value = rjson::find(request, "Select");
     if (!select_value) {
         // If "Select" is not specified, it defaults to ALL_ATTRIBUTES
-        // on a base table, or ALL_PROJECTED_ATTRIBUTES on an index
-        return table_type == table_or_view_type::base ?
+        // on a base table or vector index, or ALL_PROJECTED_ATTRIBUTES on GSI/LSI.
+        return (table_type == table_or_view_type::base || table_type == table_or_view_type::vector_index) ?
             select_type::regular : select_type::projection;
     }
     if (!select_value->IsString()) {
@@ -6209,9 +6212,409 @@ calculate_bounds_condition_expression(schema_ptr schema,
     return {std::move(partition_ranges), std::move(ck_bounds)};
 }
 
+static future<executor::request_return_type> query_vector(
+        service::storage_proxy& proxy,
+        vector_search::vector_store_client& vsc,
+        const rjson::value& request,
+        service::client_state& client_state,
+        tracing::trace_state_ptr trace_state,
+        service_permit permit,
+        bool enforce_authorization,
+        bool warn_authorization,
+        alternator::stats& stats,
+        parsed::expression_cache& parsed_expr_cache) {
+    // If vector search is requested, IndexName must be given and must
+    // refer to a vector index - not to a GSI or LSI.
+    const rjson::value* index_name_v = rjson::find(request, "IndexName");
+    if (!index_name_v || !index_name_v->IsString()) {
+        co_return api_error::validation(
+            "VectorSearch requires IndexName referring to a vector index");
+    }
+    std::string_view index_name = rjson::to_string_view(*index_name_v);
+    schema_ptr base_schema = get_table(proxy, request);
+    bool is_vector = std::ranges::any_of(base_schema->indices(), [&](const index_metadata& im) {
+        const auto& opts = im.options();
+        auto it = opts.find(db::index::secondary_index::custom_class_option_name);
+        return im.name() == index_name && it != opts.end() && it->second == "vector_index";
+    });
+    if (!is_vector) {
+        co_return api_error::validation(
+            format("VectorSearch IndexName '{}' is not a vector index.", index_name));
+    }
+    // QueryVector is required inside VectorSearch.
+    const rjson::value* vector_search = rjson::find(request, "VectorSearch");
+    if (!vector_search || !vector_search->IsObject()) {
+        co_return api_error::validation(
+            "VectorSearch requires a VectorSearch parameter");
+    }
+    const rjson::value* query_vector = rjson::find(*vector_search, "QueryVector");
+    if (!query_vector || !query_vector->IsObject()) {
+        co_return api_error::validation(
+            "VectorSearch requires a QueryVector parameter");
+    }
+    // QueryVector should be is a DynamoDB value, which must be of type "L"
+    // (a list), containing only elements of type "N" (numbers). The number
+    // of these elements must be exactly the "dimensions" defined for this
+    // vector index. We'll now validate all these assumptions and parse
+    // all the numbers in the vector into an std::vector<float> query_vec -
+    // the type that ann() wants.
+    int dimensions = 0;
+    for (const index_metadata& im : base_schema->indices()) {
+        if (im.name() == index_name) {
+            auto dims_it = im.options().find("dimensions");
+            if (dims_it != im.options().end()) {
+                try {
+                    dimensions = std::stoi(dims_it->second);
+                } catch (...) {}
+            }
+            break;
+        }
+    }
+    throwing_assert(dimensions > 0);
+    const rjson::value* qv_list = rjson::find(*query_vector, "L");
+    if (!qv_list || !qv_list->IsArray()) {
+        co_return api_error::validation(
+            "VectorSearch QueryVector must be a list of numbers");
+    }
+    const auto& arr = qv_list->GetArray();
+    if ((int)arr.Size() != dimensions) {
+        co_return api_error::validation(
+            format("VectorSearch QueryVector length {} does not match index Dimensions {}",
+                arr.Size(), dimensions));
+    }
+    std::vector<float> query_vec;
+    query_vec.reserve(arr.Size());
+    for (const rjson::value& elem : arr) {
+        if (!elem.IsObject()) {
+            co_return api_error::validation(
+                "VectorSearch QueryVector must contain only numbers");
+        }
+        const rjson::value* n_val = rjson::find(elem, "N");
+        if (!n_val || !n_val->IsString()) {
+            co_return api_error::validation(
+                "VectorSearch QueryVector must contain only numbers");
+        }
+        std::string_view num_str = rjson::to_string_view(*n_val);
+        float f;
+        auto [ptr, ec] = std::from_chars(num_str.data(), num_str.data() + num_str.size(), f);
+        if (ec != std::errc{} || ptr != num_str.data() + num_str.size()) {
+            co_return api_error::validation(
+                format("VectorSearch QueryVector element '{}' is not a valid number", num_str));
+        }
+        query_vec.push_back(f);
+    }
+
+    // Limit is mandatory for vector search: it defines k, the number of
+    // nearest neighbors to return.
+    const rjson::value* limit_json = rjson::find(request, "Limit");
+    if (!limit_json || !limit_json->IsUint()) {
+        co_return api_error::validation("VectorSearch requires a positive integer Limit parameter");
+    }
+    uint32_t limit = limit_json->GetUint();
+    if (limit == 0) {
+        co_return api_error::validation("Limit must be greater than 0");
+    }
+
+    // Consistent reads are not supported for vector search, just like GSI.
+    if (get_read_consistency(request) != db::consistency_level::LOCAL_ONE) {
+        co_return api_error::validation(
+            "Consistent reads are not allowed on vector indexes");
+    }
+
+    // Pagination (ExclusiveStartKey) is not supported for vector search.
+    if (rjson::find(request, "ExclusiveStartKey")) {
+        co_return api_error::validation(
+            "VectorSearch does not support pagination (ExclusiveStartKey)");
+    }
+
+    // ScanIndexForward is not supported for vector search: the ordering of
+    // results is determined by vector distance, not by the sort key.
+    if (rjson::find(request, "ScanIndexForward")) {
+        co_return api_error::validation(
+            "VectorSearch does not support ScanIndexForward");
+    }
+
+    std::unordered_set<std::string> used_attribute_names;
+    std::unordered_set<std::string> used_attribute_values;
+    // Parse the Select parameter and determine which attributes to return.
+    // For a vector index, the default Select is ALL_ATTRIBUTES (full items).
+    // ALL_PROJECTED_ATTRIBUTES is significantly more efficent because it
+    // returns what the vector store returned without looking up additional
+    // base-table data. Currently only the primary key attributes are projected
+    // but in the future we'll implement projecting additional attributes into
+    // the vector index - these additional attributes will also be usable for
+    // filtering). COUNT returns only the count without items.
+    select_type select = parse_select(request, table_or_view_type::vector_index);
+    std::optional<alternator::attrs_to_get> attrs_to_get_opt;
+    if (select == select_type::projection) {
+        // ALL_PROJECTED_ATTRIBUTES for a vector index: return only key attributes.
+        alternator::attrs_to_get key_attrs;
+        for (const column_definition& cdef : base_schema->partition_key_columns()) {
+            attribute_path_map_add("Select", key_attrs, cdef.name_as_text());
+        }
+        for (const column_definition& cdef : base_schema->clustering_key_columns()) {
+            attribute_path_map_add("Select", key_attrs, cdef.name_as_text());
+        }
+        attrs_to_get_opt = std::move(key_attrs);
+    } else {
+        attrs_to_get_opt = calculate_attrs_to_get(request, parsed_expr_cache, used_attribute_names, select);
+    }
+    // QueryFilter (the old-style API) is not supported for vector search Queries.
+    if (rjson::find(request, "QueryFilter")) {
+        co_return api_error::validation(
+            "VectorSearch does not support QueryFilter; use FilterExpression instead");
+    }
+    // FilterExpression: post-filter the vector search results by any attribute.
+    filter flt(parsed_expr_cache, request, filter::request_type::QUERY,
+               used_attribute_names, used_attribute_values);
+    const rjson::value* expression_attribute_names = rjson::find(request, "ExpressionAttributeNames");
+    verify_all_are_used(expression_attribute_names, used_attribute_names, "ExpressionAttributeNames", "Query");
+    const rjson::value* expression_attribute_values = rjson::find(request, "ExpressionAttributeValues");
+    verify_all_are_used(expression_attribute_values, used_attribute_values, "ExpressionAttributeValues", "Query");
+
+    // Verify the user has SELECT permission on the base table, as we
+    // do for every type of read operation after validating the input
+    // parameters.
+    co_await verify_permission(enforce_authorization, warn_authorization,
+            client_state, base_schema, auth::permission::SELECT, stats);
+
+    // Query the vector store for the approximate nearest neighbors.
+    auto timeout = executor::default_timeout();
+    abort_on_expiry aoe(timeout);
+    auto pkeys_result = co_await vsc.ann(
+            base_schema->ks_name(), std::string(index_name), base_schema,
+            std::move(query_vec), limit, rjson::empty_object(), aoe.abort_source());
+    if (!pkeys_result.has_value()) {
+        const sstring error_msg = std::visit(vector_search::error_visitor{}, pkeys_result.error());
+        co_return api_error::validation(error_msg);
+    }
+    const std::vector<vector_search::primary_key>& pkeys = pkeys_result.value();
+
+    // For SELECT=COUNT with no filter: skip fetching from the base table and
+    // just return the count of candidates returned by the vector store.
+    // If a filter is present, fall through to the base-table fetch to apply it.
+    if (select == select_type::count && !flt) {
+        rjson::value response = rjson::empty_object();
+        rjson::add(response, "Count", rjson::value(static_cast<int>(pkeys.size())));
+        rjson::add(response, "ScannedCount", rjson::value(static_cast<int>(pkeys.size())));
+        co_return rjson::print(std::move(response));
+    }
+
+    // For SELECT=ALL_PROJECTED_ATTRIBUTES with no filter: skip fetching from
+    // the base table and build items directly from the key columns returned by
+    // the vector store. If a filter is present, fall through to the base-table
+    // fetch to apply it.
+    if (select == select_type::projection && !flt) {
+        rjson::value items_json = rjson::empty_array();
+        for (const auto& pkey : pkeys) {
+            rjson::value item = rjson::empty_object();
+            std::vector<bytes> exploded_pk = pkey.partition.key().explode();
+            auto exploded_pk_it = exploded_pk.begin();
+            for (const column_definition& cdef : base_schema->partition_key_columns()) {
+                rjson::value key_val = rjson::empty_object();
+                rjson::add_with_string_name(key_val, type_to_string(cdef.type), json_key_column_value(*exploded_pk_it, cdef));
+                rjson::add_with_string_name(item, std::string_view(cdef.name_as_text()), std::move(key_val));
+                ++exploded_pk_it;
+            }
+            if (base_schema->clustering_key_size() > 0) {
+                std::vector<bytes> exploded_ck = pkey.clustering.explode();
+                auto exploded_ck_it = exploded_ck.begin();
+                for (const column_definition& cdef : base_schema->clustering_key_columns()) {
+                    rjson::value key_val = rjson::empty_object();
+                    rjson::add_with_string_name(key_val, type_to_string(cdef.type), json_key_column_value(*exploded_ck_it, cdef));
+                    rjson::add_with_string_name(item, std::string_view(cdef.name_as_text()), std::move(key_val));
+                    ++exploded_ck_it;
+                }
+            }
+            rjson::push_back(items_json, std::move(item));
+        }
+        rjson::value response = rjson::empty_object();
+        rjson::add(response, "Count", rjson::value(static_cast<int>(items_json.Size())));
+        rjson::add(response, "ScannedCount", rjson::value(static_cast<int>(pkeys.size())));
+        rjson::add(response, "Items", std::move(items_json));
+        co_return rjson::print(std::move(response));
+    }
+
+    // TODO: For SELECT=SPECIFIC_ATTRIBUTES, if they are part of the projected
+    // attributes, we should use the above optimized code path - not fall through
+    // to the read from the base table as below as we need to do if the specific
+    // attributes contain non-projected columns.
+
+    // Fetch the matching items from the base table and build the response.
+    // When a filter is present, we always fetch the full item so that all
+    // attributes are available for filter evaluation, regardless of the
+    // projection required for the final response.
+    auto selection = cql3::selection::selection::wildcard(base_schema);
+    auto regular_columns = base_schema->regular_columns()
+            | std::views::transform(&column_definition::id)
+            | std::ranges::to<query::column_id_vector>();
+    auto attrs_to_get = ::make_shared<const std::optional<alternator::attrs_to_get>>(
+        flt ? std::nullopt : std::move(attrs_to_get_opt));
+
+    rjson::value items_json = rjson::empty_array();
+    int matched_count = 0;
+
+    if (base_schema->clustering_key_size() == 0) {
+        // Hash-only table: query each partition individually, in the order
+        // returned by the vector store, to preserve vector-distance ordering
+        // in the response. A multi-partition batch read would return items in
+        // token order instead, which would be wrong.
+        // FIXME: do this more efficiently with a batched read that preserves
+        // ordering.
+        for (const auto& pkey : pkeys) {
+            std::vector<query::clustering_range> bounds{
+                    query::clustering_range::make_open_ended_both_sides()};
+            auto partition_slice = query::partition_slice(std::move(bounds), {},
+                    regular_columns, selection->get_query_options());
+            auto command = ::make_lw_shared<query::read_command>(
+                    base_schema->id(), base_schema->version(), partition_slice,
+                    proxy.get_max_result_size(partition_slice),
+                    query::tombstone_limit(proxy.get_tombstone_limit()));
+            service::storage_proxy::coordinator_query_result qr =
+                    co_await proxy.query(base_schema, command,
+                            {dht::partition_range(pkey.partition)},
+                            db::consistency_level::LOCAL_ONE,
+                            service::storage_proxy::coordinator_query_options(
+                                    timeout, permit, client_state, trace_state));
+            auto opt_item = executor::describe_single_item(base_schema, partition_slice,
+                    *selection, *qr.query_result, *attrs_to_get);
+            if (opt_item && (!flt || flt.check(*opt_item))) {
+                ++matched_count;
+                if (select != select_type::count) {
+                    if (select == select_type::projection) {
+                        // A filter caused us to fall through here instead of
+                        // taking the projection early-exit above. Reconstruct
+                        // the key-only item from the full item we fetched.
+                        rjson::value key_item = rjson::empty_object();
+                        for (const column_definition& cdef : base_schema->partition_key_columns()) {
+                            if (const rjson::value* v = rjson::find(*opt_item, cdef.name_as_text())) {
+                                rjson::add_with_string_name(key_item, cdef.name_as_text(), rjson::copy(*v));
+                            }
+                        }
+                        rjson::push_back(items_json, std::move(key_item));
+                    } else {
+                        // When a filter caused us to fetch the full item, apply the
+                        // requested projection (attrs_to_get_opt) before returning it.
+                        // This mirrors describe_items_visitor::end_row() which removes
+                        // extra filter attributes from the returned item.
+                        if (flt && attrs_to_get_opt) {
+                            for (const auto& [attr_name, subpath] : *attrs_to_get_opt) {
+                                if (!subpath.has_value()) {
+                                    if (rjson::value* toplevel = rjson::find(*opt_item, attr_name)) {
+                                        if (!hierarchy_filter(*toplevel, subpath)) {
+                                            rjson::remove_member(*opt_item, attr_name);
+                                        }
+                                    }
+                                }
+                            }
+                            std::vector<std::string> to_remove;
+                            for (auto it = opt_item->MemberBegin(); it != opt_item->MemberEnd(); ++it) {
+                                std::string key(it->name.GetString(), it->name.GetStringLength());
+                                if (!attrs_to_get_opt->contains(key)) {
+                                    to_remove.push_back(std::move(key));
+                                }
+                            }
+                            for (const auto& key : to_remove) {
+                                rjson::remove_member(*opt_item, key);
+                            }
+                        }
+                        rjson::push_back(items_json, std::move(*opt_item));
+                    }
+                }
+            }
+        }
+    } else {
+        // Hash+range table: query each (partition, clustering) pair individually.
+        // FIXME: do this more efficiently!!!
+        for (const auto& pkey : pkeys) {
+            std::vector<query::clustering_range> bounds{
+                    query::clustering_range::make_singular(pkey.clustering)};
+            auto partition_slice = query::partition_slice(std::move(bounds), {},
+                    regular_columns, selection->get_query_options());
+            auto command = ::make_lw_shared<query::read_command>(
+                    base_schema->id(), base_schema->version(), partition_slice,
+                    proxy.get_max_result_size(partition_slice),
+                    query::tombstone_limit(proxy.get_tombstone_limit()));
+            service::storage_proxy::coordinator_query_result qr =
+                    co_await proxy.query(base_schema, command,
+                            {dht::partition_range(pkey.partition)},
+                            db::consistency_level::LOCAL_ONE,
+                            service::storage_proxy::coordinator_query_options(
+                                    timeout, permit, client_state, trace_state));
+            auto opt_item = executor::describe_single_item(base_schema, partition_slice,
+                    *selection, *qr.query_result, *attrs_to_get);
+            if (opt_item && (!flt || flt.check(*opt_item))) {
+                ++matched_count;
+                if (select != select_type::count) {
+                    if (select == select_type::projection) {
+                        // A filter caused us to fall through here; project to keys.
+                        rjson::value key_item = rjson::empty_object();
+                        for (const column_definition& cdef : base_schema->partition_key_columns()) {
+                            if (const rjson::value* v = rjson::find(*opt_item, cdef.name_as_text())) {
+                                rjson::add_with_string_name(key_item, cdef.name_as_text(), rjson::copy(*v));
+                            }
+                        }
+                        for (const column_definition& cdef : base_schema->clustering_key_columns()) {
+                            if (const rjson::value* v = rjson::find(*opt_item, cdef.name_as_text())) {
+                                rjson::add_with_string_name(key_item, cdef.name_as_text(), rjson::copy(*v));
+                            }
+                        }
+                        rjson::push_back(items_json, std::move(key_item));
+                    } else {
+                        // When a filter caused us to fetch the full item, apply the
+                        // requested projection (attrs_to_get_opt) before returning it.
+                        // This mirrors describe_items_visitor::end_row() which removes
+                        // extra filter attributes from the returned item.
+                        if (flt && attrs_to_get_opt) {
+                            for (const auto& [attr_name, subpath] : *attrs_to_get_opt) {
+                                if (!subpath.has_value()) {
+                                    if (rjson::value* toplevel = rjson::find(*opt_item, attr_name)) {
+                                        if (!hierarchy_filter(*toplevel, subpath)) {
+                                            rjson::remove_member(*opt_item, attr_name);
+                                        }
+                                    }
+                                }
+                            }
+                            std::vector<std::string> to_remove;
+                            for (auto it = opt_item->MemberBegin(); it != opt_item->MemberEnd(); ++it) {
+                                std::string key(it->name.GetString(), it->name.GetStringLength());
+                                if (!attrs_to_get_opt->contains(key)) {
+                                    to_remove.push_back(std::move(key));
+                                }
+                            }
+                            for (const auto& key : to_remove) {
+                                rjson::remove_member(*opt_item, key);
+                            }
+                        }
+                        rjson::push_back(items_json, std::move(*opt_item));
+                    }
+                }
+            }
+        }
+    }
+
+    rjson::value response = rjson::empty_object();
+    if (select == select_type::count) {
+        rjson::add(response, "Count", rjson::value(matched_count));
+    } else {
+        rjson::add(response, "Count", rjson::value(static_cast<int>(items_json.Size())));
+        rjson::add(response, "Items", std::move(items_json));
+    }
+    rjson::add(response, "ScannedCount", rjson::value(static_cast<int>(pkeys.size())));
+    co_return rjson::print(std::move(response));
+}
+
 future<executor::request_return_type> executor::query(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
     _stats.api_operations.query++;
     elogger.trace("Querying {}", request);
+
+    if (rjson::find(request, "VectorSearch")) {
+        // If vector search is requested, we have a separate code path.
+        // IndexName must be given and must refer to a vector index - not
+        // to a GSI or LSI as the code below assumes.
+        return query_vector(_proxy, _vsc, request, client_state, trace_state, std::move(permit),
+                _enforce_authorization, _warn_authorization, _stats, *_parsed_expression_cache);
+    }
 
     auto [schema, table_type] = get_table_or_view(_proxy, request);
     get_stats_from_schema(_proxy, *schema)->api_operations.query++;

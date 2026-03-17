@@ -18,6 +18,7 @@
 #include "service/memory_limiter.hh"
 #include "auth/service.hh"
 #include "service/qos/service_level_controller.hh"
+#include "vector_search/vector_store_client.hh"
 
 using namespace seastar;
 
@@ -35,6 +36,7 @@ controller::controller(
         sharded<service::memory_limiter>& memory_limiter,
         sharded<auth::service>& auth_service,
         sharded<qos::service_level_controller>& sl_controller,
+        sharded<vector_search::vector_store_client>& vsc,
         const db::config& config,
         seastar::scheduling_group sg)
     : protocol_server(sg)
@@ -47,6 +49,7 @@ controller::controller(
     , _memory_limiter(memory_limiter)
     , _auth_service(auth_service)
     , _sl_controller(sl_controller)
+    , _vsc(vsc)
     , _config(config)
 {
 }
@@ -92,7 +95,7 @@ future<> controller::start_server() {
             return cfg.alternator_timeout_in_ms;
         };
         _executor.start(std::ref(_gossiper), std::ref(_proxy), std::ref(_ss), std::ref(_mm), std::ref(_sys_dist_ks),
-                        sharded_parameter(get_cdc_metadata, std::ref(_cdc_gen_svc)), _ssg.value(),
+                        sharded_parameter(get_cdc_metadata, std::ref(_cdc_gen_svc)), std::ref(_vsc), _ssg.value(),
                         sharded_parameter(get_timeout_in_ms, std::ref(_config))).get();
         _server.start(std::ref(_executor), std::ref(_proxy), std::ref(_gossiper), std::ref(_auth_service), std::ref(_sl_controller)).get();
         // Note: from this point on, if start_server() throws for any reason,

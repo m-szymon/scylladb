@@ -43,6 +43,10 @@ namespace qos {
 class service_level_controller;
 }
 
+namespace vector_search {
+class vector_store_client;
+}
+
 namespace alternator {
 
 // This is the official DynamoDB API version.
@@ -65,6 +69,7 @@ class controller : public protocol_server {
     sharded<service::memory_limiter>& _memory_limiter;
     sharded<auth::service>& _auth_service;
     sharded<qos::service_level_controller>& _sl_controller;
+    sharded<vector_search::vector_store_client>& _vsc;
     const db::config& _config;
 
     std::vector<socket_address> _listen_addresses;
@@ -83,6 +88,7 @@ public:
         sharded<service::memory_limiter>& memory_limiter,
         sharded<auth::service>& auth_service,
         sharded<qos::service_level_controller>& sl_controller,
+        sharded<vector_search::vector_store_client>& vsc,
         const db::config& config,
         seastar::scheduling_group sg);
 
