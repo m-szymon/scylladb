@@ -83,6 +83,8 @@ def run_alternator_cmd(pid, dir):
         ]
     else:
         cmd += ['--alternator-port', '8000']
+    if '--vs' in sys.argv:
+        cmd += ['--vector-store-primary-uri', f'http://{ip}:6080']
     cmd += extra_scylla_options
 
     for i in remove_scylla_options:
@@ -110,6 +112,31 @@ if '--https' in sys.argv:
     alternator_url=f"https://{ip}:8043"
 else:
     alternator_url=f"http://{ip}:8000"
+
+# If the "--vs" option is given, also run the vector store process.
+# The vector store is run in its own temporary directory, but runs
+# on the same IP address as Scylla (otherwise, the first of the two
+# which we will run will not know where to find the second).
+def run_vector_store_cmd(pid, dir):
+    global ip # same IP as Scylla, see comment above
+    print('Booting Vector Store on ' + ip + ' in ' + dir + '...')
+    with open(f'{dir}/.password', 'w') as f:
+        print('cassandra', file=f)
+    env = {
+        'VECTOR_STORE_URI': f'{ip}:6080',
+        'VECTOR_STORE_SCYLLADB_URI': f'{ip}:9042',
+        'VECTOR_STORE_SCYLLADB_USERNAME': 'cassandra',
+        'VECTOR_STORE_SCYLLADB_PASSWORD_FILE': f'{dir}/.password',
+    }
+    cmd = [
+        # TODO: make the location of the vector store executable configurable
+        '../vector-store/target/release/vector-store'
+    ]
+    return (cmd, env)
+if '--vs' in sys.argv:
+    sys.argv.remove('--vs')
+    run.run_with_temporary_dir(run_vector_store_cmd)
+
 
 # Wait for both CQL and Alternator APIs to become responsive. We obviously
 # need the Alternator API to test Alternator, but currently we also need
