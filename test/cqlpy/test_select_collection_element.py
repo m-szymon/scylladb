@@ -7,6 +7,8 @@
 #############################################################################
 
 import pytest
+import time
+
 from cassandra.protocol import InvalidRequest
 from .util import unique_name, unique_key_int, new_test_table, new_type, new_function
 
@@ -154,3 +156,69 @@ def test_subscript_function_arg(scylla_only, cql, test_keyspace, table1):
         p = unique_key_int()
         cql.execute(f"INSERT INTO {table1}(p,m) VALUES ({p}, " + "{1:10,2:20})")
         assert list(cql.execute(f"SELECT add_one(m[1]) FROM {table1} WHERE p={p}")) == [(11,)]
+
+# Test selecting the WRITETIME() of a specific key in a map column.
+# Cassandra added support for this in Cassandra 5.0 (CASSANDRA-8877).
+# Reproduces issue #15427.
+def test_writetime_map_element(cql, table1):
+    p = unique_key_int()
+    # Generate two resonable but different timestamps
+    timestamp = int(time.time() * 1000000)
+    timestamp1 = timestamp - 1234
+    timestamp2 = timestamp - 1217 # newer than timestamp1
+    # Insert two elements with INSERT and check their timestamps
+    cql.execute(f'INSERT INTO {table1}(p,m) VALUES ({p}, {{1:10,2:20}}) USING TIMESTAMP {timestamp1}')
+    assert list(cql.execute(f"SELECT WRITETIME(m[1]) FROM {table1} WHERE p={p}")) == [(timestamp1,)]
+    assert list(cql.execute(f"SELECT WRITETIME(m[2]) FROM {table1} WHERE p={p}")) == [(timestamp1,)]
+    # Replace one element and add another with UPDATE, using a newer timestamp
+    # and check the WRITETIME.
+    cql.execute(f'UPDATE {table1} USING TIMESTAMP {timestamp2} SET m = m + {{2:30}}  WHERE p={p}')
+    cql.execute(f'UPDATE {table1} USING TIMESTAMP {timestamp2} SET m = m + {{3:30}} WHERE p={p}')
+    assert list(cql.execute(f"SELECT WRITETIME(m[1]) FROM {table1} WHERE p={p}")) == [(timestamp1,)]
+    assert list(cql.execute(f"SELECT WRITETIME(m[2]) FROM {table1} WHERE p={p}")) == [(timestamp2,)]
+    assert list(cql.execute(f"SELECT WRITETIME(m[3]) FROM {table1} WHERE p={p}")) == [(timestamp2,)]
+
+# Test selecting the TTL() of a specific key in a map column.
+# Cassandra added support for this in Cassandra 5.0 (CASSANDRA-8877).
+# Reproduces issue #15427.
+def test_ttl_map_element(cql, table1):
+    p = unique_key_int()
+    ttl1 = 3600  # 1 hour
+    ttl2 = 7200  # 2 hours, different from ttl1
+    # Insert two elements with INSERT and check their TTLs
+    cql.execute(f'INSERT INTO {table1}(p,m) VALUES ({p}, {{1:10,2:20}}) USING TTL {ttl1}')
+    # Because of the time taken to execute the statements and reading the
+    # TTL() reads the remaining TTL, we can't check for an exact TTL value,
+    # but we can check that it's less than or equal to the TTL we set and
+    # greater than TTL minus some small amount of time.
+    [(t,)] = cql.execute(f"SELECT TTL(m[1]) FROM {table1} WHERE p={p}")
+    assert t is not None and t <= ttl1 and t > ttl1 - 60
+    [(t,)] = cql.execute(f"SELECT TTL(m[2]) FROM {table1} WHERE p={p}")
+    assert t is not None and t <= ttl1 and t > ttl1 - 60
+    # Replace one element and add another with UPDATE, using a different TTL
+    # and check the TTLs.
+    cql.execute(f'UPDATE {table1} USING TTL {ttl2} SET m = m + {{2:30}} WHERE p={p}')
+    cql.execute(f'UPDATE {table1} USING TTL {ttl2} SET m = m + {{3:30}} WHERE p={p}')
+    [(t,)] = cql.execute(f"SELECT TTL(m[1]) FROM {table1} WHERE p={p}")
+    assert t is not None and t <= ttl1 and t > ttl1 - 60
+    [(t,)] = cql.execute(f"SELECT TTL(m[2]) FROM {table1} WHERE p={p}")
+    assert t is not None and t <= ttl2 and t > ttl2 - 60
+    [(t,)] = cql.execute(f"SELECT TTL(m[3]) FROM {table1} WHERE p={p}")
+    assert t is not None and t <= ttl2 and t > ttl2 - 60
+
+# Test that WRITETIME() and TTL() cannot be used on an entire unfrozen
+# collection column. Because an unfrozen collection is stored as multiple
+# cells that may each have different timestamps and TTLs, there is no single
+# WRITETIME or TTL to return for the whole collection.
+# It appears that Cassandra has a bug here: It allows selecting WRITETIME()
+# of an entire unfrozen map, but returns an array of timestamps, where you
+# can't even tell which timestamp belongs to which element. So we'll mark
+# this test cassandra_bug - see CASSANDRA-21240.
+def test_writetime_ttl_whole_collection_forbidden(cql, table1, cassandra_bug):
+    p = unique_key_int()
+    timestamp = int(time.time() * 1000000) - 1234 # a reasonable timestamp
+    cql.execute(f'INSERT INTO {table1}(p,m) VALUES ({p}, {{1:10,2:20}}) USING TIMESTAMP {timestamp}')
+    with pytest.raises(InvalidRequest):
+        cql.execute(f"SELECT WRITETIME(m) FROM {table1} WHERE p={p}")
+    with pytest.raises(InvalidRequest):
+        cql.execute(f"SELECT TTL(m) FROM {table1} WHERE p={p}")
