@@ -4155,7 +4155,9 @@ future<std::vector<rjson::value>> executor::describe_multi_item(schema_ptr schem
         rjson::value item = rjson::empty_object();
         uint64_t item_length_in_bytes = 0;
         describe_single_item(*selection, result_row, *attrs_to_get, item, &item_length_in_bytes);
-        item_callback(item_length_in_bytes);
+        if (item_callback) {
+            item_callback(item_length_in_bytes);
+        }
         ret.push_back(std::move(item));
         co_await coroutine::maybe_yield();
     }
