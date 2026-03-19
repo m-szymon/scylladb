@@ -3709,6 +3709,42 @@ bytes_ostream serialize_for_cql(const abstract_type& type, collection_mutation_v
     });
 }
 
+bytes_ostream serialize_for_cql_with_timestamps(const abstract_type& type, collection_mutation_view v) {
+    SCYLLA_ASSERT(type.is_multi_cell());
+    const auto& ctype = static_cast<const map_type_impl&>(type);
+    return v.with_deserialized(type, [&] (collection_mutation_view_description mv) -> bytes_ostream {
+        // Step 1: produce regular CQL bytes (copy of mv is made inside serialize_for_cql_aux, mv is still valid after)
+        bytes_ostream cql = serialize_for_cql_aux(ctype, mv);
+
+        // Step 2: build extended format:
+        // [int32: -1 magic][uint32: cql byte length][cql bytes]
+        // [int32: entry count][count entries: (int32 keylen)(key bytes)(int64 timestamp)(int64 expiry, -1 if no TTL)]
+        bytes_ostream out;
+        write_simple<int32_t>(out, int32_t(-1));            // magic marker (impossible as valid CQL count)
+        write_simple<uint32_t>(out, uint32_t(cql.size())); // length of regular CQL bytes
+        out.append(cql);                                    // regular CQL bytes
+
+        auto count_slot = out.write_place_holder(collection_size_len());
+        int elements = 0;
+        for (auto&& e : mv.cells) {
+            if (e.second.is_live(mv.tomb, false)) {
+                bytes_view key = e.first;
+                write_simple<int32_t>(out, int32_t(key.size()));
+                out.write(key);
+                write_simple<int64_t>(out, e.second.timestamp());
+                int64_t expiry_raw = -1;
+                if (e.second.is_live_and_has_ttl()) {
+                    expiry_raw = e.second.expiry().time_since_epoch().count();
+                }
+                write_simple<int64_t>(out, expiry_raw);
+                ++elements;
+            }
+        }
+        write_collection_size(count_slot, elements);
+        return out;
+    });
+}
+
 bytes serialize_field_index(size_t idx) {
     if (idx >= size_t(std::numeric_limits<int16_t>::max())) {
         // should've been rejected earlier, but just to be sure...

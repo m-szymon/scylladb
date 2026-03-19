@@ -1259,6 +1259,23 @@ prepare_column_mutation_attribute(
                     receiver->type->name(), receiver->name->text()));
     }
     auto column = prepare_expression(cma.column, db, keyspace, schema_opt, nullptr);
+    // Handle WRITETIME(m[key]) / TTL(m[key]) - a subscript into a non-frozen map column
+    if (auto sub = expr::as_if<subscript>(&column)) {
+        auto inner_cval = expr::as_if<column_value>(&sub->val);
+        if (!inner_cval) {
+            throw exceptions::invalid_request_exception(fmt::format("{} on a subscript expects a column, got {}", cma.kind, sub->val));
+        }
+        if (inner_cval->col->is_primary_key()) {
+            throw exceptions::invalid_request_exception(fmt::format("{} is not legal on primary key component {}", cma.kind, inner_cval->col->name_as_text()));
+        }
+        if (!inner_cval->col->type->is_map() || !inner_cval->col->type->is_multi_cell()) {
+            throw exceptions::invalid_request_exception(fmt::format("{} on a subscript is only valid for non-frozen map columns", cma.kind));
+        }
+        return column_mutation_attribute{
+            .kind = cma.kind,
+            .column = std::move(column),
+        };
+    }
     auto cval = expr::as_if<column_value>(&column);
     if (!cval) {
         throw exceptions::invalid_request_exception(fmt::format("{} expects a column, but {} is a general expression", cma.kind, column));

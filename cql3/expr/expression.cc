@@ -1206,6 +1206,43 @@ cql3::raw_value do_evaluate(const field_selection& field_select, const evaluatio
 static
 cql3::raw_value
 do_evaluate(const column_mutation_attribute& cma, const evaluation_inputs& inputs) {
+    // Handle WRITETIME(m[key]) / TTL(m[key]) on a map element
+    if (auto sub = expr::as_if<subscript>(&cma.column)) {
+        auto inner_col = expr::as_if<column_value>(&sub->val);
+        if (!inner_col) {
+            on_internal_error(expr_logger, fmt::format("evaluating column_mutation_attribute subscript: inner expression is not a column: {}", sub->val));
+        }
+        int32_t index = inputs.selection->index_of(*inner_col->col);
+        if (inputs.collection_element_metadata.empty() || index < 0 || size_t(index) >= inputs.collection_element_metadata.size()) {
+            return cql3::raw_value::make_null();
+        }
+        auto evaluated_key = evaluate(sub->sub, inputs);
+        if (evaluated_key.is_null()) {
+            return cql3::raw_value::make_null();
+        }
+        const auto& meta = inputs.collection_element_metadata[index];
+        switch (cma.kind) {
+        case column_mutation_attribute::attribute_kind::writetime: {
+            const auto it = evaluated_key.view().with_linearized([&] (bytes_view key_bv) {
+                return meta.timestamps.find(bytes(key_bv));
+            });
+            if (it == meta.timestamps.end()) {
+                return cql3::raw_value::make_null();
+            }
+            return raw_value::make_value(data_value(it->second).serialize());
+        }
+        case column_mutation_attribute::attribute_kind::ttl: {
+            const auto it = evaluated_key.view().with_linearized([&] (bytes_view key_bv) {
+                return meta.ttls.find(bytes(key_bv));
+            });
+            if (it == meta.ttls.end() || it->second < 0) {
+                return cql3::raw_value::make_null();
+            }
+            return raw_value::make_value(data_value(it->second).serialize());
+        }
+        }
+        on_internal_error(expr_logger, "evaluating column_mutation_attribute subscript with unexpected kind");
+    }
     auto col = expr::as_if<column_value>(&cma.column);
     if (!col) {
         on_internal_error(expr_logger, fmt::format("evaluating column_mutation_attribute of non-column {}", cma.column));

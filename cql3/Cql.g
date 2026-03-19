@@ -429,10 +429,10 @@ unaliasedSelector returns [uexpression tmp]
     :  ( c=cident                                  { tmp = unresolved_identifier{std::move(c)}; }
        | v=value                                   { tmp = std::move(v); }
        | K_COUNT '(' countArgument ')'             { tmp = make_count_rows_function_expression(); }
-       | K_WRITETIME '(' c=cident ')'              { tmp = column_mutation_attribute{column_mutation_attribute::attribute_kind::writetime,
-                                                                                              unresolved_identifier{std::move(c)}}; }
-       | K_TTL       '(' c=cident ')'              { tmp = column_mutation_attribute{column_mutation_attribute::attribute_kind::ttl,
-                                                                                              unresolved_identifier{std::move(c)}}; }
+       | K_WRITETIME '(' a=subscriptExpr ')'       { tmp = column_mutation_attribute{column_mutation_attribute::attribute_kind::writetime,
+                                                                                              std::move(a)}; }
+       | K_TTL       '(' a=subscriptExpr ')'       { tmp = column_mutation_attribute{column_mutation_attribute::attribute_kind::ttl,
+                                                                                              std::move(a)}; }
        | f=functionName args=selectionFunctionArgs { tmp = function_call{std::move(f), std::move(args)}; }
        | K_CAST      '(' arg=unaliasedSelector K_AS t=native_type ')'  { tmp = cast{.style = cast::cast_style::sql, .arg = std::move(arg), .type = std::move(t)}; }
        )

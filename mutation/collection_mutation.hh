@@ -133,6 +133,12 @@ collection_mutation difference(const abstract_type&, collection_mutation_view, c
 // Serializes the given collection of cells to a sequence of bytes ready to be sent over the CQL protocol.
 bytes_ostream serialize_for_cql(const abstract_type&, collection_mutation_view);
 
+// Like serialize_for_cql, but uses an extended format that embeds per-element timestamps and expiries,
+// for use with WRITETIME(col[key]) and TTL(col[key]) selectors.
+// The format is: [magic -1 as int32][cql-bytes-length as uint32][regular CQL bytes][count as int32]
+// [per-element: (key-len as int32)(key bytes)(timestamp as int64)(expiry as int64 in gc_clock ticks, -1 if none)]
+bytes_ostream serialize_for_cql_with_timestamps(const abstract_type&, collection_mutation_view);
+
 template <>
 struct fmt::formatter<collection_mutation_view::printer> : fmt::formatter<string_view> {
     auto format(const collection_mutation_view::printer&, fmt::format_context& ctx) const
