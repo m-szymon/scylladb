@@ -297,6 +297,36 @@ struct vector_store_client::impl {
         return _primary_uris.empty() && _secondary_uris.empty();
     }
 
+    auto get_index_status(keyspace_name keyspace, index_name name, abort_source& as)
+            -> future<vector_store_client::index_status> {
+        using index_status = vector_store_client::index_status;
+        if (is_disabled()) {
+            co_return index_status::creating;
+        }
+        auto path = format("/api/v1/indexes/{}/{}/status", keyspace, name);
+        auto resp = co_await request(operation_type::GET, std::move(path), std::nullopt, as);
+        if (!resp || resp->status != status_type::ok) {
+            co_return index_status::creating;
+        }
+        try {
+            auto json = rjson::parse(response_content_to_sstring(resp->content));
+            const auto* status = rjson::find(json, "status");
+            if (!status || !status->IsString()) {
+                co_return index_status::creating;
+            }
+            auto sv = rjson::to_string_view(*status);
+            if (sv == "SERVING") {
+                co_return index_status::serving;
+            }
+            if (sv == "BOOTSTRAPPING") {
+                co_return index_status::backfilling;
+            }
+            co_return index_status::creating;
+        } catch (...) {
+            co_return index_status::creating;
+        }
+    }
+
     auto ann(keyspace_name keyspace, index_name name, schema_ptr schema, vs_vector vs_vector, limit limit, const rjson::value& filter, abort_source& as)
             -> future<std::expected<primary_keys, ann_error>> {
         if (is_disabled()) {
@@ -374,6 +404,10 @@ auto vector_store_client::stop() -> future<> {
 
 auto vector_store_client::is_disabled() const -> bool {
     return _impl->is_disabled();
+}
+
+auto vector_store_client::get_index_status(keyspace_name keyspace, index_name name, abort_source& as) -> future<index_status> {
+    return _impl->get_index_status(std::move(keyspace), std::move(name), as);
 }
 
 auto vector_store_client::ann(keyspace_name keyspace, index_name name, schema_ptr schema, vs_vector vs_vector, limit limit, const rjson::value& filter, abort_source& as)

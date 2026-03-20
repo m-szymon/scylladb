@@ -74,6 +74,21 @@ public:
     /// Check if the vector_store_client is disabled.
     auto is_disabled() const -> bool;
 
+    /// The operational status of a single vector index, as reported by the vector store.
+    enum class index_status {
+        /// The index is not yet ready: initializing, not yet discovered, or the
+        /// vector store is unreachable.
+        creating,
+        /// The index is performing the initial full scan of the base table
+        /// (backfilling). Queries may be served but results are incomplete.
+        backfilling,
+        /// The index has completed the initial scan and is fully operational.
+        serving,
+    };
+
+    /// Query the vector store for the current status of a specific vector index.
+    auto get_index_status(keyspace_name keyspace, index_name name, abort_source& as) -> future<index_status>;
+
     /// Request the vector store service for the primary keys of the nearest neighbors
     auto ann(keyspace_name keyspace, index_name name, schema_ptr schema, vs_vector vs_vector, limit limit, const rjson::value& filter, abort_source& as)
             -> future<std::expected<primary_keys, ann_error>>;

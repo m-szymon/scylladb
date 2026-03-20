@@ -955,6 +955,7 @@ future<rjson::value> executor::fill_table_description(schema_ptr schema, table_s
         }
         // List vector indexes, if this table has any:
         rjson::value vector_index_array = rjson::empty_array();
+        abort_on_expiry vector_index_status_aoe(executor::default_timeout());
         for (const index_metadata& im : schema->indices()) {
             const auto& opts = im.options();
             auto class_it = opts.find(db::index::secondary_index::custom_class_option_name);
@@ -979,6 +980,25 @@ future<rjson::value> executor::fill_table_description(schema_ptr schema, table_s
                 }
             }
             rjson::add(entry, "VectorAttribute", std::move(vector_attribute));
+            // Always return a Projection. Currently only KEYS_ONLY is
+            // supported, so we always return that.
+            rjson::value projection = rjson::empty_object();
+            rjson::add(projection, "ProjectionType", "KEYS_ONLY");
+            rjson::add(entry, "Projection", std::move(projection));
+            // Report IndexStatus and Backfilling based on the vector store's
+            // reported state: SERVING -> ACTIVE, BOOTSTRAPPING -> CREATING+Backfilling,
+            // anything else (INITIALIZING, unreachable, etc.) -> CREATING.
+            auto vstatus = co_await _vsc.get_index_status(
+                    schema->ks_name(), im.name(), vector_index_status_aoe.abort_source());
+            using index_status = vector_search::vector_store_client::index_status;
+            if (vstatus == index_status::serving) {
+                rjson::add(entry, "IndexStatus", "ACTIVE");
+            } else {
+                rjson::add(entry, "IndexStatus", "CREATING");
+                if (vstatus == index_status::backfilling) {
+                    rjson::add(entry, "Backfilling", rjson::value(true));
+                }
+            }
             rjson::push_back(vector_index_array, std::move(entry));
         }
         if (!vector_index_array.Empty()) {
