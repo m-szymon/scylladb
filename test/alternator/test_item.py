@@ -878,3 +878,13 @@ def test_many_attributes(test_table_s):
         AttributeUpdates={key: {'Value': more_attributes[key], 'Action': 'PUT'} for key in more_attributes.keys()})
     item = {**item, **more_attributes}
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == item
+
+# Test that attribute names can contain basically any character - even things
+# like backslashes, quotes, spaces, newlines, and even null (!).
+def test_attribute_allowed_chars(test_table_s):
+    p = random_string()
+    s = bytes(range(256)).decode('latin-1')
+    for chars in ['abc', ' ', "-\\\"'_.:/#&", s]:
+        test_table_s.update_item(Key={'p': p},
+            AttributeUpdates={chars: {'Value': chars, 'Action': 'PUT'}})
+        assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'][chars] == chars
