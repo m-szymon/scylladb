@@ -2705,6 +2705,29 @@ std::unordered_map<bytes, std::string> si_key_attributes(data_dictionary::table 
     return ret;
 }
 
+// Get a map from attribute name (bytes) to dimensions (int) for all vector
+// indexes defined on this table's schema. Used to validate written values
+// against the vector index constraints.
+static std::unordered_map<bytes, int> vector_index_attributes(const schema& s) {
+    std::unordered_map<bytes, int> ret;
+    for (const index_metadata& im : s.indices()) {
+        const auto& opts = im.options();
+        auto class_it = opts.find(db::index::secondary_index::custom_class_option_name);
+        if (class_it == opts.end() || class_it->second != "vector_index") {
+            continue;
+        }
+        auto target_it = opts.find(cql3::statements::index_target::target_option_name);
+        auto dims_it = opts.find("dimensions");
+        if (target_it == opts.end() || dims_it == opts.end()) {
+            continue;
+        }
+        try {
+            ret[to_bytes(target_it->second)] = std::stoi(dims_it->second);
+        } catch (...) {}
+    }
+    return ret;
+}
+
 // When an attribute is a key (hash or sort) of one of the GSIs or LSIs on a
 // table, DynamoDB refuses an update to that attribute with an unsuitable
 // value. Unsuitable values are:
@@ -2725,13 +2748,10 @@ std::unordered_map<bytes, std::string> si_key_attributes(data_dictionary::table 
 //
 // validate_value_if_index_key() should only be called after validate_value()
 // already validated that the value itself has a valid form.
-static inline void validate_value_if_index_key(
+static void validate_value_if_index_key(
         std::unordered_map<bytes, std::string> key_attributes,
         const bytes& attribute,
         const rjson::value& value) {
-    if (key_attributes.empty()) {
-        return;
-    }
     auto it = key_attributes.find(attribute);
     if (it == key_attributes.end()) {
         // Given attribute is not a key column with a fixed type, so no
@@ -2755,10 +2775,59 @@ static inline void validate_value_if_index_key(
     }
 }
 
+// When an attribute is the target of a vector index on the table, a write
+// to that attribute is rejected unless the value is a DynamoDB list (type
+// "L") of exactly the declared number of numeric (type "N") elements, where
+// each number can be represented as a 32-bit float.
+//
+// validate_value_if_vector_index_attribute() should only be called after
+// validate_value() already confirmed the value has a valid DynamoDB form.
+static void validate_value_if_vector_index_attribute(
+        const std::unordered_map<bytes, int>& vector_attrs,
+        const bytes& attribute,
+        const rjson::value& value) {
+    auto it = vector_attrs.find(attribute);
+    if (it == vector_attrs.end()) {
+        return;
+    }
+    int dimensions = it->second;
+    std::string_view attr_name = to_string_view(attribute);
+    // value is a DynamoDB typed value: an object with one member whose key
+    // is the type tag. validate_value() already checked the overall shape.
+    std::string_view value_type = rjson::to_string_view(value.MemberBegin()->name);
+    if (value_type != "L") {
+        throw api_error::validation(fmt::format(
+            "Vector index attribute '{}' must be a list of {} numbers, got type {}",
+            attr_name, dimensions, value_type));
+    }
+    const rjson::value& list = value.MemberBegin()->value;
+    if (!list.IsArray() || (int)list.Size() != dimensions) {
+        throw api_error::validation(fmt::format(
+            "Vector index attribute '{}' must be a list of exactly {} numbers, got {} elements",
+            attr_name, dimensions, list.IsArray() ? (int)list.Size() : -1));
+    }
+    for (const rjson::value& elem : list.GetArray()) {
+        if (!elem.IsObject() || elem.MemberCount() != 1 ||
+                rjson::to_string_view(elem.MemberBegin()->name) != "N") {
+            throw api_error::validation(fmt::format(
+                "Vector index attribute '{}' must contain only numbers", attr_name));
+        }
+        std::string_view num_str = rjson::to_string_view(elem.MemberBegin()->value);
+        float f;
+        auto [ptr, ec] = std::from_chars(num_str.data(), num_str.data() + num_str.size(), f);
+        if (ec != std::errc{} || ptr != num_str.data() + num_str.size() || !std::isfinite(f)) {
+            throw api_error::validation(fmt::format(
+                "Vector index attribute '{}' element '{}' cannot be represented as a 32-bit float",
+                attr_name, num_str));
+        }
+    }
+}
+
 put_or_delete_item::put_or_delete_item(const rjson::value& item, schema_ptr schema, put_item, std::unordered_map<bytes, std::string> key_attributes)
         : _pk(pk_from_json(item, schema)), _ck(ck_from_json(item, schema)) {
     _cells = std::vector<cell>();
     _cells->reserve(item.MemberCount());
+    auto vec_attrs = vector_index_attributes(*schema);
     for (auto it = item.MemberBegin(); it != item.MemberEnd(); ++it) {
         bytes column_name = to_bytes(rjson::to_string_view(it->name));
         validate_value(it->value, "PutItem");
@@ -2768,7 +2837,14 @@ put_or_delete_item::put_or_delete_item(const rjson::value& item, schema_ptr sche
         if (!cdef) {
             // This attribute may be a key column of one of the GSI or LSI,
             // in which case there are some limitations on the value.
-            validate_value_if_index_key(key_attributes, column_name, it->value);
+            if (!key_attributes.empty()) {
+                validate_value_if_index_key(key_attributes, column_name, it->value);
+            }
+            // This attribute may also be a vector index target column,
+            // in which case it must be a list of the right number of floats.
+            if (!vec_attrs.empty()) {
+                validate_value_if_vector_index_attribute(vec_attrs, column_name, it->value);
+            }
             bytes value = serialize_item(it->value);
             if (value.size()) {
                 // ScyllaDB uses one extra byte compared to DynamoDB for the bytes length
@@ -4264,6 +4340,9 @@ public:
     // Saved list of GSI keys in the table being updated, used for
     // validate_value_if_index_key()
     std::unordered_map<bytes, std::string> _key_attributes;
+    // Saved map of vector index target attributes to their dimensions, used
+    // for validate_value_if_vector_index_attribute()
+    std::unordered_map<bytes, int> _vector_index_attributes;
 
     parsed::condition_expression _condition_expression;
 
@@ -4369,6 +4448,7 @@ update_item_operation::update_item_operation(parsed::expression_cache& parsed_ex
 
     _key_attributes = si_key_attributes(proxy.data_dictionary().find_table(
         _schema->ks_name(), _schema->cf_name()));
+    _vector_index_attributes = vector_index_attributes(*_schema);
 }
 
 // These are the cases where update_item_operation::apply() needs to use
@@ -4665,7 +4745,14 @@ void update_item_operation::update_attribute(bytes&& column_name, const rjson::v
     } else {
         // This attribute may be a key column of one of the GSIs or LSIs,
         // in which case there are some limitations on the value.
-        validate_value_if_index_key(_key_attributes, column_name, json_value);
+        if (!_key_attributes.empty()) {
+            validate_value_if_index_key(_key_attributes, column_name, json_value);
+        }
+        // This attribute may also be a vector index target column,
+        // in which case it must be a list of the right number of floats.
+        if (!_vector_index_attributes.empty()) {
+            validate_value_if_vector_index_attribute(_vector_index_attributes, column_name, json_value);
+        }
         modified_attrs.put(std::move(column_name), serialize_item(json_value), ts);
     }
 }
