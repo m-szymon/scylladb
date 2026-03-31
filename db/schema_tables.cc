@@ -2001,6 +2001,14 @@ future<std::map<sstring, schema_ptr>> create_tables_from_tables_partition(sharde
     auto tables_with_cdc = std::map<sstring, schema_ptr>();
     co_await max_concurrent_for_each(result->rows().begin(), result->rows().end(), max_concurrent, [&] (const query::result_set_row& row) -> future<> {
         schema_ptr cfm = co_await create_table_from_table_row(proxy, row);
+        // NOTE: Tables with a Vector Index have CDC implicitly enabled (cdc::cdc_enabled()
+        // returns true) but cdc_options().enabled() returns false for them. Such tables do
+        // have a CDC log table created at index-creation time. It is unclear whether they
+        // also need the deferred loading below (to link base table schema to its CDC log
+        // schema via make_with_cdc()). If they do, this condition should use
+        // cdc::cdc_enabled(*cfm) instead — but this requires verifying that the CDC log
+        // table is discoverable via cdc::log_name() at startup and that skipping it causes
+        // actual runtime failures rather than just a warning.
         if (!cfm->cdc_options().enabled()) {
             tables.emplace(cfm->cf_name(), std::move(cfm));
         } else {

@@ -129,7 +129,7 @@ public:
     std::optional<service::cas_shard> shard_for_execute(bool needs_read_before_write);
 
 private:
-    inline bool should_fill_preimage() const { return _schema->cdc_options().enabled(); }
+    inline bool should_fill_preimage() const { return cdc::cdc_enabled(*_schema); }
 };
 
 } // namespace alternator

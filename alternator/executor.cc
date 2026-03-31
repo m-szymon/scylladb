@@ -3562,7 +3562,7 @@ future<> executor::cas_write(schema_ptr schema, service::cas_shard cas_shard, co
     auto cdc_opts = cdc::per_request_options{
         .alternator = true,
         .alternator_streams_increased_compatibility =
-                schema->cdc_options().enabled() && _proxy.data_dictionary().get_config().alternator_streams_increased_compatibility(),
+                cdc::cdc_enabled(*schema) && _proxy.data_dictionary().get_config().alternator_streams_increased_compatibility(),
     };
     return _proxy.cas(schema, std::move(cas_shard), *op_ptr, nullptr, to_partition_ranges(dk),
             {timeout, std::move(permit), client_state, trace_state},
@@ -3614,7 +3614,7 @@ future<> executor::do_batch_write(
         bool any_cdc_enabled = false;
         for (auto& b : mutation_builders) {
             mutations.push_back(b.second.build(b.first, now));
-            any_cdc_enabled |= b.first->cdc_options().enabled();
+            any_cdc_enabled |= cdc::cdc_enabled(*b.first);
         }
         return _proxy.mutate(std::move(mutations),
                 db::consistency_level::LOCAL_QUORUM,
