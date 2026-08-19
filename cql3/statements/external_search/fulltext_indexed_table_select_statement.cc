@@ -26,13 +26,53 @@
 #include <seastar/core/future.hh>
 #include <seastar/coroutine/exception.hh>
 
+#include <algorithm>
+
 namespace cql3::statements {
 
 namespace {
 
+/// One of the two values a full-text search reports, as a SELECT occurrence can ask for it.  Both
+/// are read from the one search the rows are ranked by and validated by the one set of rules in
+/// prepare_bm25_selectors(); this is everything that differs between them.
+struct bm25_value {
+    /// The function it is called by: what a call is matched against, and what a message about that
+    /// call names.
+    const functions::function_name& function;
+    std::string_view name;
+    /// The type of the temporary slot it is delivered in.  Must be the function's declared return
+    /// type, since that is what the selector reading the slot was typed by.
+    data_type slot_type;
+    /// Where the index of that slot is kept, allocated on the value's first occurrence.
+    std::optional<size_t> bm25_ordering_info::*slot;
+    /// Where to record the column the value is computed from, for a value generated from the row's
+    /// own text - which has to be read from every row.  Null for a value the index reports itself.
+    const column_definition* bm25_ordering_info::*source_column;
+};
+
+/// The value the given call asks for, or std::nullopt when it is not a call to either of them.
+///
+/// The table is built per call rather than kept in a static: a data_type is thread_local, one
+/// instance per shard, so a table shared between shards would hand every shard the types of
+/// whichever one built it first.
+std::optional<bm25_value> selected_bm25_value(const expr::function_call& fc) {
+    const bm25_value values[] = {
+            {functions::BM25_FUNCTION_NAME, "BM25", float_type, &bm25_ordering_info::score_temporary_index, nullptr},
+            {functions::BM25_HIGHLIGHT_FUNCTION_NAME, "BM25_HIGHLIGHT", utf8_type, &bm25_ordering_info::highlight_temporary_index,
+                    &bm25_ordering_info::highlighted_column},
+    };
+    auto it = std::ranges::find_if(values, [&fc](const bm25_value& value) { return expr::is_native_function_call(fc, value.function); });
+    return it != std::ranges::end(values) ? std::optional<bm25_value>(*it) : std::nullopt;
+}
+
 std::optional<expr::expression> validate_bm25_where_restriction(const expr::binary_operator& binop,
         const bm25_ordering_info& ordering_info) {
     const auto& fc = expr::as<expr::function_call>(binop.lhs);
+    if (expr::is_native_function_call(fc, functions::BM25_HIGHLIGHT_FUNCTION_NAME)) {
+        // A fragment is generated from a row the search has already selected, so there is nothing
+        // here to restrict by.
+        throw exceptions::invalid_request_exception("BM25_HIGHLIGHT() is only supported in the SELECT clause");
+    }
     auto [col, where_term] = external_search::extract_call_arguments(fc, "BM25");
     if (col->name_as_text() != ordering_info.index.target_column()) {
         throw exceptions::invalid_request_exception("Full-text search queries must reference the same column in both WHERE and ORDER BY clauses");
@@ -58,34 +98,49 @@ void prepare_bm25_selectors(std::vector<selection::prepared_selector>& prepared_
     for (auto& ps : prepared_selectors) {
         ps.expr = expr::search_and_replace(ps.expr, [&](const expr::expression& candidate) -> std::optional<expr::expression> {
             const auto* fc = expr::as_if<expr::function_call>(&candidate);
-            if (!fc || !expr::is_native_function_call(*fc, functions::BM25_FUNCTION_NAME)) {
+            if (!fc) {
+                return std::nullopt;
+            }
+            const auto value = selected_bm25_value(*fc);
+            if (!value) {
                 return std::nullopt;
             }
 
             if (!ordering_info) {
-                throw exceptions::invalid_request_exception("BM25() is not supported in the SELECT clause without matching ORDER BY and WHERE clauses");
+                throw exceptions::invalid_request_exception(seastar::format(
+                        "{}() is not supported in the SELECT clause without matching ORDER BY and WHERE clauses", value->name));
+            }
+            auto& info = *ordering_info;
+
+            // Every call in the statement describes the one search the rows are ranked by, whichever
+            // of its values it asks for, so they all have to name the column and the search term the
+            // other two clauses do.
+            auto [col, sel_term] = external_search::extract_call_arguments(*fc, value->name);
+            if (col->name_as_text() != info.index.target_column()) {
+                throw exceptions::invalid_request_exception(
+                        seastar::format("{}() in SELECT must reference the same column as BM25() in WHERE and ORDER BY", value->name));
             }
 
-            auto [col, sel_term] = external_search::extract_call_arguments(*fc, "BM25");
-            if (col->name_as_text() != ordering_info->index.target_column()) {
-                throw exceptions::invalid_request_exception("BM25() in SELECT must reference the same column as BM25() in WHERE and ORDER BY");
-            }
-
-            if (auto deferred = external_search::check_query_value(sel_term, ordering_info->search_term,
-                        "BM25() in SELECT must use the same search term as BM25() in WHERE and ORDER BY")) {
+            if (auto deferred = external_search::check_query_value(sel_term, info.search_term,
+                        seastar::format("{}() in SELECT must use the same search term as BM25() in WHERE and ORDER BY", value->name))) {
                 // Lifted out of the selector tree, so nothing else registers its bind marker.
                 expr::fill_prepare_context(*deferred, ctx);
-                ordering_info->deferred_select_terms.push_back(std::move(*deferred));
+                info.deferred_select_terms.push_back({std::move(*deferred), value->name});
             }
 
-            // Every bm25() in the SELECT reports the same score, so one slot serves them all.
-            if (!ordering_info->temporary_index) {
-                ordering_info->temporary_index = temporaries_allocator.allocate();
+            // Every occurrence of one value reports the same thing, so one slot serves them all.
+            auto& slot = info.*value->slot;
+            if (!slot) {
+                slot = temporaries_allocator.allocate();
+            }
+            if (value->source_column) {
+                // Checked equal to the ranked column just above.
+                info.*value->source_column = col;
             }
 
             return expr::expression(expr::temporary{
-                    .index = *ordering_info->temporary_index,
-                    .type = float_type,
+                    .index = *slot,
+                    .type = value->slot_type,
                     .replaced_expr = candidate,
             });
         });
@@ -159,8 +214,17 @@ std::optional<bm25_ordering_info> get_bm25_ordering_info(
                 "Full-text search queries do not support additional WHERE restrictions");
     }
 
-    if (ordering_info->temporary_index) {
+    // A score slot was allocated, so BM25() was selected and a provider will fill that slot per row
+    // by matching each row to the full-text index's response.
+    if (ordering_info->score_temporary_index) {
         external_search::fetch_primary_key_columns(*selection, *schema);
+    }
+
+    // A fragment slot was allocated, so BM25_HIGHLIGHT() was selected and the index will be asked to
+    // generate the fragment from the row's own text - which it stores none of, so the text has to be
+    // read from every row even when the query does not select the column itself.
+    if (ordering_info->highlight_temporary_index) {
+        external_search::fetch_column(*selection, *ordering_info->highlighted_column);
     }
 
     return ::make_shared<cql3::statements::fulltext_indexed_table_select_statement>(
@@ -215,9 +279,9 @@ future<shared_ptr<cql_transport::messages::result_message>> fulltext_indexed_tab
     }
 
     for (const auto& sel_term : _bm25_ordering_info.deferred_select_terms) {
-        if (expr::evaluate(sel_term, options) != search_term_val) {
-            co_await coroutine::return_exception(exceptions::invalid_request_exception(
-                    "BM25() in SELECT must use the same search term as BM25() in WHERE and ORDER BY"));
+        if (expr::evaluate(sel_term.term, options) != search_term_val) {
+            co_await coroutine::return_exception(exceptions::invalid_request_exception(seastar::format(
+                    "{}() in SELECT must use the same search term as BM25() in WHERE and ORDER BY", sel_term.function_name)));
         }
     }
 
@@ -232,8 +296,8 @@ future<shared_ptr<cql_transport::messages::result_message>> fulltext_indexed_tab
 
     throwing_assert(pkeys->size() <= limit);
 
-    auto provider = _bm25_ordering_info.temporary_index
-                            ? std::make_unique<external_score_provider>(pkeys.value(), *_bm25_ordering_info.temporary_index, *_schema)
+    auto provider = _bm25_ordering_info.score_temporary_index
+                            ? std::make_unique<external_score_provider>(pkeys.value(), *_bm25_ordering_info.score_temporary_index, *_schema)
                             : nullptr;
     co_return co_await query_base_table(qp, state, options, pkeys.value(), timeout, std::move(provider));
 }

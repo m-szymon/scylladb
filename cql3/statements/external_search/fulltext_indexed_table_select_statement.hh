@@ -15,15 +15,30 @@
 
 namespace cql3::statements {
 
+/// A SELECT occurrence's search term that prepare could not tell apart from the ORDER BY term,
+/// together with the name of the function it was written in, so that execution can name that
+/// function when the two turn out to differ.
+struct deferred_select_term {
+    expr::expression term;
+    std::string_view function_name;
+};
+
 struct bm25_ordering_info {
     secondary_index::index index;
     expr::expression search_term;
     // Temporary slot the score is delivered in, allocated on the first bm25()
     // occurrence in SELECT and filled per row by external_score_provider.
-    std::optional<size_t> temporary_index;
+    std::optional<size_t> score_temporary_index;
+    // Temporary slot the fragment is delivered in, allocated on the first bm25_highlight()
+    // occurrence in SELECT and filled per row from the second request's answer.
+    std::optional<size_t> highlight_temporary_index;
+    // The column the fragment is generated from, recorded when a fragment is selected: its text has
+    // to be read from every row and sent to the index.  Always the column the rows are ranked by.
+    const column_definition* highlighted_column = nullptr;
     // The SELECT occurrences' search terms that only execution can compare, a bind marker standing
-    // where at least one of the two values will be.
-    std::vector<expr::expression> deferred_select_terms;
+    // where at least one of the two values will be, each with the function it was written in so that
+    // execution can name it.
+    std::vector<deferred_select_term> deferred_select_terms;
     // The WHERE clause's term, likewise.
     std::optional<expr::expression> deferred_where_term;
 };
@@ -35,11 +50,11 @@ std::optional<bm25_ordering_info> get_bm25_ordering_info(
         schema_ptr schema,
         const expr::function_call& fc);
 
-/// Lowers every bm25() call in the SELECT clause, nested occurrences included, to the slot the
-/// row's score is delivered in, allocating it on the first one.  Rejects an occurrence with no
-/// BM25 ordering and WHERE clause to agree with, or one that disagrees with them on the column or
-/// the search term; a disagreement only execution can settle is recorded in ordering_info for it
-/// to check.
+/// Lowers every call to a full-text search's values in the SELECT clause - bm25() and
+/// bm25_highlight(), nested occurrences included - to the slot that value is delivered in,
+/// allocating it on the first occurrence of each.  Rejects an occurrence with no BM25 ordering and
+/// WHERE clause to agree with, or one that disagrees with them on the column or the search term; a
+/// disagreement only execution can settle is recorded in ordering_info for it to check.
 void prepare_bm25_selectors(std::vector<selection::prepared_selector>& prepared_selectors, std::optional<bm25_ordering_info>& ordering_info,
         expr::temporary_allocator& temporaries_allocator, prepare_context& ctx);
 
