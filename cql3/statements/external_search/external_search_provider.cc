@@ -191,8 +191,7 @@ external_search_provider::external_search_provider(std::vector<std::pair<size_t,
     , _dropped(std::move(dropped)) {
 }
 
-bool external_search_provider::try_fill(std::vector<cql3::raw_value>& temporaries, std::span<const bytes>, std::span<const bytes>,
-        const query::result_row_view&, const query::result_row_view*) const {
+bool external_search_provider::try_fill(std::vector<cql3::raw_value>& temporaries) const {
     // Advanced for every row offered, including one that is dropped: the values were computed for
     // the same rows, in the same order, so the position has to move with them.
     const auto row = _next_row++;
