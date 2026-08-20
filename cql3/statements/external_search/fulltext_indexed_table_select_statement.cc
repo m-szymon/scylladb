@@ -21,16 +21,12 @@
 #include "data_dictionary/data_dictionary.hh"
 #include "db/consistency_level_validations.hh"
 #include "exceptions/exceptions.hh"
-#include "keys/keys.hh"
 #include "query/query-request.hh"
-#include "query/query-result-reader.hh"
 #include "schema/schema.hh"
 #include "types/types.hh"
 #include "utils/assert.hh"
-#include "utils/log.hh"
 
 #include <seastar/core/future.hh>
-#include <seastar/core/on_internal_error.hh>
 #include <seastar/coroutine/exception.hh>
 
 #include <algorithm>
@@ -38,9 +34,6 @@
 namespace cql3::statements {
 
 namespace {
-
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-logging::logger flogger("fulltext_search");
 
 /// One of the two values a full-text search reports, as a SELECT occurrence can ask for it.  Both
 /// are read from the one search the rows are ranked by and validated by the one set of rules in
@@ -101,98 +94,6 @@ std::optional<expr::expression> validate_bm25_where_restriction(const expr::bina
             "Full-text search queries must use the same search term in both WHERE and ORDER BY clauses");
 }
 
-/// Walks a base-table result collecting the text of one column per row.
-///
-/// It has to emit exactly the rows result_set_builder::visitor emits, in the same order, or the
-/// fragments - which come back positionally - would attach to the wrong rows.  It does because it
-/// is the same walk: the same merged result read with the same slice.  The one thing that does not
-/// follow from that is repeated here, that visitor's rule for a partition holding nothing but a
-/// static row.
-class document_collector {
-    const schema& _schema;
-    const selection::selection& _selection;
-    const column_definition& _column;
-    size_t _column_index;
-    std::vector<sstring>& _documents;
-
-    clustering_key_prefix _clustering_key = clustering_key_prefix::make_empty();
-    uint64_t _row_count = 0;
-
-    void collect(const query::result_row_view& static_row, const query::result_row_view* row) {
-        // A row whose text is null or absent still needs a document.  The index answers an empty
-        // one with no fragment, which is what such a row should report anyway.
-        auto value = _column.is_clustering_key() ? clustering_key_component() : expr::get_non_pk_values(_selection, static_row, row)[_column_index];
-        _documents.push_back(value ? value_cast<sstring>(_column.type->deserialize(managed_bytes_view(*value))) : sstring());
-    }
-
-    std::optional<managed_bytes> clustering_key_component() const {
-        auto components = _clustering_key.explode(_schema);
-        if (components.size() <= _column.component_index()) {
-            return std::nullopt;
-        }
-        return managed_bytes(components[_column.component_index()]);
-    }
-
-public:
-    document_collector(const schema& schema, const selection::selection& selection, const column_definition& column, size_t column_index,
-            std::vector<sstring>& documents)
-        : _schema(schema)
-        , _selection(selection)
-        , _column(column)
-        , _column_index(column_index)
-        , _documents(documents) {
-    }
-
-    void accept_new_partition(const partition_key&, uint64_t row_count) {
-        _row_count = row_count;
-    }
-
-    void accept_new_partition(uint64_t row_count) {
-        _row_count = row_count;
-    }
-
-    void accept_new_row(const clustering_key& key, const query::result_row_view& static_row, const query::result_row_view& row) {
-        _clustering_key = key;
-        accept_new_row(static_row, row);
-    }
-
-    void accept_new_row(const query::result_row_view& static_row, const query::result_row_view& row) {
-        collect(static_row, &row);
-    }
-
-    void accept_partition_end(const query::result_row_view& static_row) {
-        if (_row_count == 0) {
-            // The builder emits one row for a partition that holds only a static row, so there is a
-            // document to collect for it too.
-            _clustering_key = clustering_key_prefix::make_empty();
-            collect(static_row, nullptr);
-        }
-    }
-};
-
-/// Where in the values get_non_pk_values() hands back the highlighted column sits.  That vector is
-/// aligned with the selection's columns, which is also the order the slice asks the replicas for
-/// them in, so the three agree by construction.
-size_t column_index_in(const selection::selection& selection, const column_definition& column) {
-    const auto& columns = selection.get_columns();
-    auto it = std::ranges::find(columns, &column);
-    if (it == columns.end()) {
-        on_internal_error(flogger, seastar::format("column {} is to be highlighted but was not asked for", column.name_as_text()));
-    }
-    return std::distance(columns.begin(), it);
-}
-
-/// The text of `column` in every row of `result`, for the index to mark the matched terms in.  One
-/// document per row, in the order the rows will be emitted in, and an empty one where the row has no
-/// text: the index answers positionally, so a row passed over here would shift the fragment of every
-/// row after it.
-std::vector<sstring> collect_documents(const query::result& result, const query::partition_slice& slice, const selection::selection& selection,
-        const column_definition& column, const schema& schema) {
-    auto documents = std::vector<sstring>{};
-    query::result_view::consume(result, slice, document_collector(schema, selection, column, column_index_in(selection, column), documents));
-    return documents;
-}
-
 /// Asks the index to mark the terms of `search_term` in each of `documents`.  One request for them
 /// all, answered positionally, so the fragments come back lined up with the rows the documents were
 /// collected from.
@@ -212,6 +113,17 @@ future<vector_search::vector_store_client::highlights> fetch_highlights(vector_s
                 exceptions::invalid_request_exception(std::visit(vector_search::vector_store_client::fts_error_visitor{}, fragments.error())));
     }
     co_return std::move(fragments.value());
+}
+
+/// The fragments as the slot that reports them holds each one: text, or null for a row the index
+/// found no fragment in - such a row is kept, with the value left absent.
+std::vector<cql3::raw_value> to_values(const vector_search::vector_store_client::highlights& fragments) {
+    auto values = std::vector<cql3::raw_value>{};
+    values.reserve(fragments.size());
+    for (const auto& fragment : fragments) {
+        values.push_back(fragment ? cql3::raw_value::make_value(utf8_type->decompose(*fragment)) : cql3::raw_value::make_null());
+    }
+    return values;
 }
 
 } // anonymous namespace
@@ -421,19 +333,23 @@ future<shared_ptr<cql_transport::messages::result_message>> fulltext_indexed_tab
 
     auto read = co_await query_base_table(qp, state, options, timeout, pkeys.value());
 
-    // The fragment is generated from the row's own text, so it can only be asked for now that the
-    // rows are read.
-    auto highlights = vector_search::vector_store_client::highlights{};
-    if (_bm25_ordering_info.highlight_temporary_index && read.rows) {
-        highlights = co_await fetch_highlights(qp.vector_store_client(), _schema->ks_name(), _index.metadata().name(), search_term_text,
-                collect_documents(*read.rows.value(), read.command->slice, *_selection, *_bm25_ordering_info.highlighted_column, *_schema),
-                aoe.abort_source());
-    }
+    const auto score_slot = _bm25_ordering_info.score_temporary_index;
+    const auto fragment_slot = _bm25_ordering_info.highlight_temporary_index;
 
-    auto provider = _bm25_ordering_info.score_temporary_index || _bm25_ordering_info.highlight_temporary_index
-                            ? std::make_unique<external_search_provider>(pkeys.value(), _bm25_ordering_info.score_temporary_index, *_schema,
-                                      _bm25_ordering_info.highlight_temporary_index, std::move(highlights))
-                            : nullptr;
+    auto provider = std::unique_ptr<external_search_provider>{};
+    if (read.rows && (score_slot || fragment_slot)) {
+        // What the search says about a row can only be lined up with it now that the rows are read,
+        // and a fragment does not exist at all until the index has been sent their text.
+        auto answers = match_search_results(*read.rows.value(), read.command->slice, *_schema, *_selection, pkeys.value(), score_slot,
+                fragment_slot ? _bm25_ordering_info.highlighted_column : nullptr);
+
+        if (fragment_slot) {
+            auto fragments = co_await fetch_highlights(qp.vector_store_client(), _schema->ks_name(), _index.metadata().name(), search_term_text,
+                    std::move(answers.documents), aoe.abort_source());
+            answers.slots.emplace_back(*fragment_slot, to_values(fragments));
+        }
+        provider = std::make_unique<external_search_provider>(std::move(answers.slots), std::move(answers.dropped));
+    }
     co_return co_await emit_result_set(std::move(read), options, provider.get());
 }
 

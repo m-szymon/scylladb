@@ -277,10 +277,17 @@ future<shared_ptr<cql_transport::messages::result_message>> vector_indexed_table
         pkeys->erase(pkeys->begin() + limit, pkeys->end());
     }
 
-    auto provider = _ann_ordering_info.temporary_index
-                            ? std::make_unique<external_search_provider>(pkeys.value(), _ann_ordering_info.temporary_index, *_schema)
-                            : nullptr;
-    co_return co_await emit_result_set(co_await query_base_table(qp, state, options, timeout, pkeys.value()), options, provider.get());
+    auto read = co_await query_base_table(qp, state, options, timeout, pkeys.value());
+
+    auto provider = std::unique_ptr<external_search_provider>{};
+    if (read.rows && _ann_ordering_info.temporary_index) {
+        // The similarity the index reported is matched to a row by its primary key, so it can only be
+        // lined up with the rows now that they are read.
+        auto answers = match_search_results(
+                *read.rows.value(), read.command->slice, *_schema, *_selection, pkeys.value(), _ann_ordering_info.temporary_index, nullptr);
+        provider = std::make_unique<external_search_provider>(std::move(answers.slots), std::move(answers.dropped));
+    }
+    co_return co_await emit_result_set(std::move(read), options, provider.get());
 }
 
 } // namespace statements

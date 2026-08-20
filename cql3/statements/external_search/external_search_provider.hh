@@ -9,45 +9,64 @@
 #pragma once
 
 #include "cql3/selection/selection.hh"
+#include "cql3/values.hh"
 #include "vector_search/vector_store_client.hh"
 
 #include <optional>
+#include <utility>
+#include <vector>
 
 class schema;
+class column_definition;
+
+namespace query {
+class result;
+class partition_slice;
+}
 
 namespace cql3::statements {
 
-/// The per-row values one external search's response injects into a result row.
-///
-/// Given both of them: the score comes with the ranked keys, and the fragment - which the index
-/// generates from text the coordinator sent it after reading the rows - has been asked for by the
-/// time this is built.  So nothing here fetches anything; it hands out what it was given.
-///
-/// One provider owns both because they are matched to a row differently and the two matchings are
-/// coupled.  The score is matched against the response by primary key, and its cursor only moves
-/// forward: base-table results are merged in external search primary-key order, so a row can only
-/// ever match at or after the current position, and entries stepped over are keys the index still
-/// knows about but that are no longer in the base table.  Stepping over one drops that row - and
-/// the fragment collected for it has to be consumed with it, because fragments are matched by
-/// position: the index answers with fragments alone, so there is no key on either side to match on.
-///
-/// A provider instance is therefore single-use and tied to one response - it cannot be rewound or
-/// replayed, which is worth keeping in mind when paging arrives.
-class external_search_provider : public cql3::selection::external_values_provider {
-    const vector_search::vector_store_client::primary_keys& _results;
-    mutable size_t _next_result;    // cursor into _results: which entry to match next
-    const std::optional<size_t> _score_slot;
-    const schema& _schema;
+/// What an external search has to say about each row of a base-table read, in the order the rows
+/// will be emitted.
+struct search_answers {
+    /// Ready to hand to a provider: the relevance the index gave each row, under the slot that
+    /// reports it.  Empty if the query did not ask for it.
+    std::vector<std::pair<size_t, std::vector<cql3::raw_value>>> slots;
+    /// The rows to leave out of the result set, because the search turned out to have no relevance
+    /// for them: the index named a key whose row is no longer in the base table, or scored it with
+    /// something that is not a number.  Only a query that reports the relevance drops such a row -
+    /// one that does not is missing nothing - so this is empty when no slot was asked for.
+    std::vector<bool> dropped;
+    /// The text a fragment is to be generated from, one document per row - an empty one where the
+    /// row has no text, so that the documents stay aligned with the rows.
+    std::vector<sstring> documents;
+};
 
-    // One entry per fetched row, in the order the rows are emitted; empty unless a fragment is
-    // wanted.  Absent where the index found nothing worth marking in that row's text.
-    const vector_search::vector_store_client::highlights _highlights;
-    const std::optional<size_t> _highlight_slot;
-    mutable size_t _next_row;       // index into _highlights: which row is being filled
+/// Lines an external search's response up with the rows just read.
+///
+/// `results` is what the index answered.  Given a `score_slot`, every row is matched against it by
+/// primary key and reported under that slot, and a row with no match is reported as one to drop.
+/// `document_column`, when given, has its text collected from every row, for a second request asking
+/// the index to mark the search's terms in it.
+search_answers match_search_results(const query::result& rows, const query::partition_slice& slice, const schema& schema,
+        const selection::selection& selection, const vector_search::vector_store_client::primary_keys& results,
+        std::optional<size_t> score_slot, const column_definition* document_column);
+
+/// The values an external search injects into the rows of its result set: one per slot per row,
+/// computed by match_search_results() before the result set is built.  A pure lookup - it hands out
+/// the values of each row in the order the rows are offered to it, and says which rows to leave out.
+///
+/// Single-use and tied to one response: it cannot be rewound or replayed, which is worth keeping in
+/// mind when paging arrives.
+class external_search_provider final : public cql3::selection::external_values_provider {
+    /// The slots this provider fills, and for each of them the value of every row.
+    std::vector<std::pair<size_t, std::vector<cql3::raw_value>>> _slots;
+    /// The rows to leave out of the result set.
+    std::vector<bool> _dropped;
+    mutable size_t _next_row = 0;
 
 public:
-    external_search_provider(const vector_search::vector_store_client::primary_keys& results, std::optional<size_t> score_slot, const schema& schema,
-            std::optional<size_t> highlight_slot = std::nullopt, vector_search::vector_store_client::highlights highlights = {});
+    external_search_provider(std::vector<std::pair<size_t, std::vector<cql3::raw_value>>> slots, std::vector<bool> dropped);
 
     bool try_fill(std::vector<cql3::raw_value>& temporaries, std::span<const bytes> partition_key, std::span<const bytes> clustering_key,
             const query::result_row_view& static_row, const query::result_row_view* row) const override;
