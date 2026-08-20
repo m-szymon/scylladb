@@ -8,7 +8,7 @@
 
 #include "cql3/statements/external_search/fulltext_indexed_table_select_statement.hh"
 #include "cql3/statements/external_search/external_function.hh"
-#include "cql3/statements/external_search/external_score_provider.hh"
+#include "cql3/statements/external_search/external_search_provider.hh"
 #include "cql3/statements/raw/select_statement.hh"
 #include "cql3/expr/evaluate.hh"
 #include "cql3/expr/expression.hh"
@@ -297,7 +297,7 @@ future<shared_ptr<cql_transport::messages::result_message>> fulltext_indexed_tab
     throwing_assert(pkeys->size() <= limit);
 
     auto provider = _bm25_ordering_info.score_temporary_index
-                            ? std::make_unique<external_score_provider>(pkeys.value(), *_bm25_ordering_info.score_temporary_index, *_schema)
+                            ? std::make_unique<external_search_provider>(pkeys.value(), *_bm25_ordering_info.score_temporary_index, *_schema)
                             : nullptr;
     co_return co_await emit_result_set(co_await query_base_table(qp, state, options, timeout, pkeys.value()), options, provider.get());
 }
