@@ -278,7 +278,7 @@ future<shared_ptr<cql_transport::messages::result_message>> vector_indexed_table
     }
 
     auto provider = _ann_ordering_info.temporary_index
-                            ? std::make_unique<external_search_provider>(pkeys.value(), *_ann_ordering_info.temporary_index, *_schema)
+                            ? std::make_unique<external_search_provider>(pkeys.value(), _ann_ordering_info.temporary_index, *_schema)
                             : nullptr;
     co_return co_await emit_result_set(co_await query_base_table(qp, state, options, timeout, pkeys.value()), options, provider.get());
 }

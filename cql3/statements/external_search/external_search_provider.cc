@@ -19,16 +19,35 @@
 
 namespace cql3::statements {
 
-external_search_provider::external_search_provider(const vector_search::vector_store_client::primary_keys& results, size_t score_slot,
-        const schema& schema)
+external_search_provider::external_search_provider(const vector_search::vector_store_client::primary_keys& results, std::optional<size_t> score_slot,
+        const schema& schema, std::optional<size_t> highlight_slot, vector_search::vector_store_client::highlights highlights)
     : _results(results)
     , _next_result(0)
     , _score_slot(score_slot)
-    , _schema(schema) {
+    , _schema(schema)
+    , _highlights(std::move(highlights))
+    , _highlight_slot(highlight_slot)
+    , _next_row(0) {
 }
 
 bool external_search_provider::try_fill(std::vector<cql3::raw_value>& temporaries, std::span<const bytes> partition_key,
         std::span<const bytes> clustering_key, const query::result_row_view&, const query::result_row_view*) const {
+    if (_highlight_slot) {
+        // Advanced for every row offered, whatever the score below decides: a row the score drops
+        // still consumed the fragment collected for it.
+        const auto row_index = _next_row++;
+        // A row the index found no fragment in is kept, with the value left absent.
+        temporaries[*_highlight_slot] = row_index < _highlights.size() && _highlights[row_index]
+                                               ? cql3::raw_value::make_value(utf8_type->decompose(*_highlights[row_index]))
+                                               : cql3::raw_value::make_null();
+    }
+
+    if (!_score_slot) {
+        return true;
+    }
+
+    // Only the score is matched to a row by key; a fragment has no key on either side to match on,
+    // which is why it is matched by position above.
     const auto row_pk = ::partition_key::from_range(partition_key);
     const auto row_ck = (_schema.clustering_key_size() > 0) ? ::clustering_key_prefix::from_range(clustering_key) : ::clustering_key_prefix{};
 
@@ -61,7 +80,7 @@ bool external_search_provider::try_fill(std::vector<cql3::raw_value>& temporarie
             return false;
         }
 
-        temporaries[_score_slot] = cql3::raw_value::make_value(float_type->decompose(score));
+        temporaries[*_score_slot] = cql3::raw_value::make_value(float_type->decompose(score));
         return true;
     }
 
