@@ -82,19 +82,22 @@ text in the index and having the index read the base table itself were both reje
 That request needs the whole result in hand and it needs to suspend, neither of which
 `external_values_provider::try_fill()` can do - it is called from a synchronous walk over the
 serialized `query::result`. So reading the base-table rows and emitting them as a result set are
-two steps of `execute_search()` rather than one, and the request goes in between: the search
-collects the documents (`collect_documents()`), asks the index (`fetch_highlights()`), and
-constructs `external_search_provider` with the answer. The provider supplies per-row values and does no I/O;
-`try_fill()` is a lookup on both of its slots.
+two steps of `execute_search()` rather than one, and the correlating goes in between:
+`match_search_results()` walks the rows once, matches the ranked keys to them, and collects the text
+of the highlighted column; `fetch_highlights()` asks the index about that text; and
+`external_search_provider` is built from the answers. The provider does no I/O and knows nothing
+about the row it is filling - `try_fill()` hands out the values already computed for each row, in
+order, and says which rows to leave out.
 
 The reply is **positional**: entry *i* belongs to the *i*-th document sent, and carries no primary
-keys - so unlike the score, an excerpt cannot be matched to its row by key, because neither side of
-the exchange has one to match on. Position is exact here because the two walks - the one collecting
-documents and the one building the result set - are the same walk over the same merged result read
-with the same slice, so `collect_documents()` need only repeat the one part of
-`result_set_builder::visitor` that does not follow from that: its rule for a partition holding
-nothing but a static row. Get that rule wrong and every excerpt after the divergence belongs to the
-wrong row, which is why it is a function that can be read against the rule it mirrors.
+keys - so an excerpt cannot be matched to its row by key, because neither side of the exchange has
+one to match on. Position is exact because the two walks - `match_search_results()` and the one
+building the result set - are the same walk over the same merged result read with the same slice, so
+`match_search_results()` need only repeat the one part of `result_set_builder::visitor` that does not
+follow from that: its rule for a partition holding nothing but a static row. Get that rule wrong and
+every value after the divergence belongs to the wrong row. The score is delivered by position too,
+even though it is *matched* by key, so both values rest on that one rule and the tests for either
+exercise it.
 
 A row the index found no fragment in gets a null value and is **kept**; null means "no fragment
 for this row" and never an empty string. A failed or timed-out `/highlight` call fails the whole
