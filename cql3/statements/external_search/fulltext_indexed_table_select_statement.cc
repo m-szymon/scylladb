@@ -299,7 +299,7 @@ future<shared_ptr<cql_transport::messages::result_message>> fulltext_indexed_tab
     auto provider = _bm25_ordering_info.score_temporary_index
                             ? std::make_unique<external_score_provider>(pkeys.value(), *_bm25_ordering_info.score_temporary_index, *_schema)
                             : nullptr;
-    co_return co_await query_base_table(qp, state, options, pkeys.value(), timeout, std::move(provider));
+    co_return co_await emit_result_set(co_await query_base_table(qp, state, options, timeout, pkeys.value()), options, provider.get());
 }
 
 } // namespace cql3::statements
