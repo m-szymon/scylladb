@@ -65,6 +65,19 @@ public:
      */
     virtual bool is_external() const { return false; }
 
+    /**
+     * The reading of this function that a relation on it compares.
+     *
+     * A function is normally its own reading, and this returns its name. It differs for a function
+     * answering with more than one thing about its subject: a relation compares a single value, so
+     * one of them has to be the one a comparison means, and the call is rewritten to that reading
+     * before the relation's other side is typed against it.
+     *
+     * @return the name of the reading a relation compares, or <code>nullptr</code> when no relation
+     *         can be written on this function at all.
+     */
+    virtual const function_name* comparison_reading() const { return &name(); }
+
     virtual void print(std::ostream& os) const = 0;
 
     /**

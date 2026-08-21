@@ -2344,12 +2344,54 @@ optimize_like(const expression& e) {
     });
 }
 
+/// Rewrites a relation's left-hand side to the reading a comparison means, when the two differ.
+///
+/// A function answering with more than one thing about its subject - an external search answers
+/// with the score it gave a row and the rank that score put the row at - cannot be compared as it
+/// stands: a relation compares one value.  So the call is rewritten to the reading a comparison
+/// means before the right-hand side is typed against it, and a function no relation can be written
+/// on at all is rejected here rather than as a type error further down.
+///
+/// The sibling is resolved over the arguments already prepared for the original call, so it goes
+/// through the ordinary overload machinery and works for a function synthesized per call site as
+/// well as for a declared one.
+static expression rewrite_to_comparison_reading(expression lhs, data_dictionary::database db, const schema& table_schema) {
+    const auto* fc = as_if<function_call>(&lhs);
+    if (!fc) {
+        return lhs;
+    }
+    const auto* fun = std::get_if<shared_ptr<functions::function>>(&fc->func);
+    if (!fun) {
+        return lhs;
+    }
+    const functions::function_name* reading = (*fun)->comparison_reading();
+    if (!reading) {
+        throw exceptions::invalid_request_exception(
+                fmt::format("{}() answers with nothing a relation can compare", (*fun)->name().name));
+    }
+    if (*reading == (*fun)->name()) {
+        return lhs;
+    }
+
+    std::vector<shared_ptr<assignment_testable>> provided_args;
+    provided_args.reserve(fc->args.size());
+    for (const auto& arg : fc->args) {
+        provided_args.push_back(as_assignment_testable(arg, type_of(arg)));
+    }
+    return function_call{
+        .func = functions::instance().get(db, table_schema.ks_name(), *reading, provided_args,
+                table_schema.ks_name(), table_schema.cf_name(), nullptr),
+        .args = fc->args,
+        .lwt_cache_id = fc->lwt_cache_id,
+    };
+}
+
 binary_operator prepare_binary_operator(binary_operator binop, data_dictionary::database db, const schema& table_schema, const dialect& d) {
     std::optional<expression> prepared_lhs_opt = try_prepare_expression(binop.lhs, db, table_schema.ks_name(), &table_schema, {});
     if (!prepared_lhs_opt) {
         throw exceptions::invalid_request_exception(fmt::format("Could not infer type of {}", binop.lhs));
     }
-    auto& prepared_lhs = *prepared_lhs_opt;
+    auto prepared_lhs = rewrite_to_comparison_reading(std::move(*prepared_lhs_opt), db, table_schema);
     lw_shared_ptr<column_specification> lhs_receiver = get_lhs_receiver(prepared_lhs, table_schema);
 
     if (type_of(prepared_lhs)->references_duration() && is_slice(binop.op)) {
