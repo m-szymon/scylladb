@@ -9,6 +9,8 @@
 #include "external_search_provider.hh"
 
 #include <cmath>
+#include <map>
+#include <ranges>
 
 #include "cql3/expr/expr-utils.hh"
 #include "keys/keys.hh"
@@ -29,6 +31,33 @@ namespace {
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 logging::logger slogger("external_search");
 
+/// A row's primary key, as a value that can be looked up.
+///
+/// The serialized compound is canonical for a schema, so two keys are equal exactly when their
+/// bytes are - which is what lets an answer be found by key rather than walked to.
+using row_key = std::pair<bytes, bytes>;
+
+row_key key_of(const partition_key& partition, const clustering_key_prefix& clustering) {
+    return {to_bytes(partition.representation()), to_bytes(clustering.representation())};
+}
+
+/// What one search said about one row.
+struct answer {
+    float score;
+    int32_t rank;
+};
+
+/// One search's answer, arranged for lookup by key, together with where it is to be delivered.
+struct indexed_answer {
+    const search_answer_request& request;
+    std::map<row_key, answer> by_key;
+    size_t document_index = 0;
+
+    std::vector<cql3::raw_value> scores;
+    std::vector<cql3::raw_value> ranks;
+    std::vector<sstring> documents;
+};
+
 /// Where in the values get_non_pk_values() hands back the given column sits.  That vector is aligned
 /// with the selection's columns, which is also the order the slice asks the replicas for them in, so
 /// the three agree by construction.
@@ -41,15 +70,26 @@ size_t column_index_in(const selection::selection& selection, const column_defin
     return std::distance(columns.begin(), it);
 }
 
-/// What one walk over the rows produces, before it is arranged into search_answers.
-struct matched_rows {
-    std::vector<cql3::raw_value> scores;
-    std::vector<cql3::raw_value> ranks;
-    std::vector<bool> dropped;
-    std::vector<sstring> documents;
-};
+/// Arranges one search's answer for lookup.  An index can name a key more than once; the first
+/// entry wins, since that is the one it ranked highest.
+std::map<row_key, answer> index_by_key(const schema& schema, const vector_search::vector_store_client::primary_keys& results) {
+    auto by_key = std::map<row_key, answer>{};
+    for (size_t i = 0; i < results.size(); ++i) {
+        const auto& result = results[i];
+        // Vector Store cannot return Inf over its JSON API, and should not return NaN (null in
+        // JSON), but if it does then it has nothing to say about the row and this is not an answer.
+        if (!std::isfinite(result.similarity)) {
+            continue;
+        }
+        auto clustering = schema.clustering_key_size() > 0 ? result.clustering : clustering_key_prefix::make_empty();
+        // The rank is where the entry sits in the answer, counted from 1 - a position in what the
+        // index answered, not in the result set, so a key whose row is gone takes its rank with it.
+        by_key.emplace(key_of(result.partition.key(), clustering), answer{result.similarity, static_cast<int32_t>(i + 1)});
+    }
+    return by_key;
+}
 
-/// Walks the rows of a base-table read, lining an external search's response up with them.
+/// Walks the rows of a base-table read, looking each one up in every search's answer.
 ///
 /// It has to visit exactly the rows result_set_builder::visitor emits, in the same order, since what
 /// it produces is handed back out by position.  It does because it is the same walk: the same merged
@@ -58,94 +98,72 @@ struct matched_rows {
 class result_matcher {
     const schema& _schema;
     const selection::selection& _selection;
-
-    // The relevance, matched by primary key.  The cursor only moves forward: base-table results are
-    // merged in the index's primary-key order, so a row can only ever match at or after the current
-    // position, and an entry stepped over is a key the index still knows about but that is no longer
-    // in the base table.
-    const vector_search::vector_store_client::primary_keys& _results;
-    const bool _match_answers;
-    size_t _next_result = 0;
-
-    // The text a fragment is to be generated from.  The index stores none of it, which is why it has
-    // to be read from the rows and sent back.
-    const column_definition* _document_column;
-    const size_t _document_index;
-
-    matched_rows& _matched;
+    std::vector<indexed_answer>& _answers;
+    std::vector<bool>& _dropped;
 
     partition_key _partition_key = partition_key::make_empty();
     clustering_key_prefix _clustering_key = clustering_key_prefix::make_empty();
     uint64_t _row_count = 0;
 
-    void match_answer() {
-        while (_next_result < _results.size()) {
-            // The rank is where this entry sits in the response, counted from 1 - a position in what
-            // the index answered, not in the result set, so an entry stepped over takes its rank
-            // with it rather than the ranks after it closing up.
-            const auto rank = static_cast<int32_t>(_next_result + 1);
-            const auto& result = _results[_next_result++];
+    void visit(const query::result_row_view& static_row, const query::result_row_view* row) {
+        const auto key = key_of(_partition_key, _clustering_key);
+        bool looked_up_by_any = false;
+        bool found_by_any = false;
 
-            if (!result.partition.key().equal(_schema, _partition_key)) {
-                continue;
-            }
-            if (_schema.clustering_key_size() > 0 && !result.clustering.equal(_schema, _clustering_key)) {
-                continue;
-            }
+        for (auto& answers : _answers) {
+            // A search asked only for an excerpt is not looked up: an excerpt is generated from the
+            // row rather than found in the answer, so the primary key was never fetched for it, and
+            // whether that search also found the row is not something the query asked about.
+            const bool looked_up = answers.request.score_slot || answers.request.rank_slot;
+            looked_up_by_any |= looked_up;
+            auto it = looked_up ? answers.by_key.find(key) : answers.by_key.end();
+            found_by_any |= it != answers.by_key.end();
 
-            // Vector Store cannot return Inf over its JSON API, and should not return NaN (null in
-            // JSON), but if it does then the row has no relevance to report and is dropped.
-            if (!std::isfinite(result.similarity)) {
-                break;
+            if (answers.request.score_slot) {
+                answers.scores.push_back(it != answers.by_key.end()
+                                ? cql3::raw_value::make_value(float_type->decompose(it->second.score))
+                                : cql3::raw_value::make_null());
             }
-
-            _matched.scores.push_back(cql3::raw_value::make_value(float_type->decompose(result.similarity)));
-            _matched.ranks.push_back(cql3::raw_value::make_value(int32_type->decompose(rank)));
-            _matched.dropped.push_back(false);
-            return;
+            if (answers.request.rank_slot) {
+                answers.ranks.push_back(it != answers.by_key.end()
+                                ? cql3::raw_value::make_value(int32_type->decompose(it->second.rank))
+                                : cql3::raw_value::make_null());
+            }
+            if (answers.request.document_column) {
+                collect_document(answers, static_row, row);
+            }
         }
 
-        _matched.scores.push_back(cql3::raw_value::make_null());
-        _matched.ranks.push_back(cql3::raw_value::make_null());
-        _matched.dropped.push_back(true);
+        // Every index that named this key has since lost the row, or never named it at all: there is
+        // nothing to report about it, so it is not part of this answer.  A query that asks no search
+        // what it thought of a row drops none of them.
+        _dropped.push_back(looked_up_by_any && !found_by_any);
     }
 
-    void collect_document(const query::result_row_view& static_row, const query::result_row_view* row) {
+    void collect_document(indexed_answer& answers, const query::result_row_view& static_row, const query::result_row_view* row) {
+        const auto& column = *answers.request.document_column;
         // A row whose text is null or absent still needs a document.  The index answers an empty one
         // with no fragment, which is what such a row should report anyway.
-        auto value = _document_column->is_clustering_key() ? clustering_key_component()
-                                                           : expr::get_non_pk_values(_selection, static_row, row)[_document_index];
-        _matched.documents.push_back(value ? value_cast<sstring>(_document_column->type->deserialize(managed_bytes_view(*value))) : sstring());
+        auto value = column.is_clustering_key() ? clustering_key_component(column)
+                                                : expr::get_non_pk_values(_selection, static_row, row)[answers.document_index];
+        answers.documents.push_back(value ? value_cast<sstring>(column.type->deserialize(managed_bytes_view(*value))) : sstring());
     }
 
-    std::optional<managed_bytes> clustering_key_component() const {
+    std::optional<managed_bytes> clustering_key_component(const column_definition& column) const {
         auto components = _clustering_key.explode(_schema);
-        if (components.size() <= _document_column->component_index()) {
+        if (components.size() <= column.component_index()) {
             return std::nullopt;
         }
-        return managed_bytes(components[_document_column->component_index()]);
-    }
-
-    void visit(const query::result_row_view& static_row, const query::result_row_view* row) {
-        if (_match_answers) {
-            match_answer();
-        }
-        if (_document_column) {
-            collect_document(static_row, row);
-        }
+        return managed_bytes(components[column.component_index()]);
     }
 
 public:
-    result_matcher(const schema& schema, const selection::selection& selection,
-            const vector_search::vector_store_client::primary_keys& results, bool match_answers, const column_definition* document_column,
-            matched_rows& matched)
+    result_matcher(const schema& schema, const selection::selection& selection, std::vector<indexed_answer>& answers,
+            std::vector<bool>& dropped)
         : _schema(schema)
         , _selection(selection)
-        , _results(results)
-        , _match_answers(match_answers)
-        , _document_column(document_column)
-        , _document_index(document_column ? column_index_in(selection, *document_column) : 0)
-        , _matched(matched) {
+        , _answers(answers)
+        , _dropped(dropped) {
     }
 
     void accept_new_partition(const partition_key& key, uint64_t row_count) {
@@ -181,19 +199,29 @@ public:
 } // anonymous namespace
 
 search_answers match_search_results(const query::result& rows, const query::partition_slice& slice, const schema& schema,
-        const selection::selection& selection, const vector_search::vector_store_client::primary_keys& results,
-        std::optional<size_t> score_slot, std::optional<size_t> rank_slot, const column_definition* document_column) {
-    // Both readings come out of the one match, so the walk collects them whenever either is wanted.
-    const bool match_answers = score_slot || rank_slot;
-    auto matched = matched_rows{};
-    query::result_view::consume(rows, slice, result_matcher(schema, selection, results, match_answers, document_column, matched));
-
-    auto answers = search_answers{.dropped = std::move(matched.dropped), .documents = std::move(matched.documents)};
-    if (score_slot) {
-        answers.slots.emplace_back(*score_slot, std::move(matched.scores));
+        const selection::selection& selection, std::span<const search_answer_request> requests) {
+    auto indexed = std::vector<indexed_answer>{};
+    indexed.reserve(requests.size());
+    for (const auto& request : requests) {
+        indexed.push_back(indexed_answer{
+                .request = request,
+                .by_key = index_by_key(schema, request.results),
+                .document_index = request.document_column ? column_index_in(selection, *request.document_column) : 0,
+        });
     }
-    if (rank_slot) {
-        answers.slots.emplace_back(*rank_slot, std::move(matched.ranks));
+
+    auto answers = search_answers{};
+    query::result_view::consume(rows, slice, result_matcher(schema, selection, indexed, answers.dropped));
+
+    answers.documents.reserve(indexed.size());
+    for (auto& one : indexed) {
+        if (one.request.score_slot) {
+            answers.slots.emplace_back(*one.request.score_slot, std::move(one.scores));
+        }
+        if (one.request.rank_slot) {
+            answers.slots.emplace_back(*one.request.rank_slot, std::move(one.ranks));
+        }
+        answers.documents.push_back(std::move(one.documents));
     }
     return answers;
 }

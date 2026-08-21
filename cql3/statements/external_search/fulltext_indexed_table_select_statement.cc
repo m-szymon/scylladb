@@ -238,12 +238,17 @@ future<shared_ptr<cql_transport::messages::result_message>> fulltext_indexed_tab
     if (read.rows && (score_slot || rank_slot || fragment_slot)) {
         // What the search says about a row can only be lined up with it now that the rows are read,
         // and a fragment does not exist at all until the index has been sent their text.
-        auto answers = match_search_results(*read.rows.value(), read.command->slice, *_schema, *_selection, pkeys.value(), score_slot,
-                rank_slot, fragment_slot ? _bm25_ordering_info.highlighted_column : nullptr);
+        const search_answer_request request{
+                .results = pkeys.value(),
+                .score_slot = score_slot,
+                .rank_slot = rank_slot,
+                .document_column = fragment_slot ? _bm25_ordering_info.highlighted_column : nullptr,
+        };
+        auto answers = match_search_results(*read.rows.value(), read.command->slice, *_schema, *_selection, std::span(&request, 1));
 
         if (fragment_slot) {
             auto fragments = co_await fetch_highlights(qp.vector_store_client(), _schema->ks_name(), _index.metadata().name(), search_term_text,
-                    std::move(answers.documents), aoe.abort_source());
+                    std::move(answers.documents.front()), aoe.abort_source());
             answers.slots.emplace_back(*fragment_slot, to_values(fragments));
         }
         provider = std::make_unique<external_search_provider>(std::move(answers.slots), std::move(answers.dropped));

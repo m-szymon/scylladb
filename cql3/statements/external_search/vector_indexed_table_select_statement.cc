@@ -175,10 +175,10 @@ future<shared_ptr<cql_transport::messages::result_message>> vector_indexed_table
 
     auto provider = std::unique_ptr<external_search_provider>{};
     if (read.rows && (score_slot || rank_slot)) {
-        // What the index said about a row is matched to it by its primary key, so it can only be
-        // lined up with the rows now that they are read.
-        auto answers = match_search_results(
-                *read.rows.value(), read.command->slice, *_schema, *_selection, pkeys.value(), score_slot, rank_slot, nullptr);
+        // What the index said about a row is looked up by its primary key, so it can only be lined
+        // up with the rows now that they are read.
+        const search_answer_request request{.results = pkeys.value(), .score_slot = score_slot, .rank_slot = rank_slot};
+        auto answers = match_search_results(*read.rows.value(), read.command->slice, *_schema, *_selection, std::span(&request, 1));
         provider = std::make_unique<external_search_provider>(std::move(answers.slots), std::move(answers.dropped));
     }
     co_return co_await emit_result_set(std::move(read), options, provider.get());

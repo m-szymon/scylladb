@@ -13,6 +13,7 @@
 #include "vector_search/vector_store_client.hh"
 
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -26,32 +27,44 @@ class partition_slice;
 
 namespace cql3::statements {
 
-/// What an external search has to say about each row of a base-table read, in the order the rows
-/// will be emitted.
-struct search_answers {
-    /// Ready to hand to a provider: what the index said about each row - the relevance it gave the
-    /// row, the rank that relevance put it at - under the slot that reports it.  Empty if the query
-    /// asked for none of it.
-    std::vector<std::pair<size_t, std::vector<cql3::raw_value>>> slots;
-    /// The rows to leave out of the result set, because the search turned out to have no relevance
-    /// for them: the index named a key whose row is no longer in the base table, or scored it with
-    /// something that is not a number.  Only a query that reports the relevance drops such a row -
-    /// one that does not is missing nothing - so this is empty when no slot was asked for.
-    std::vector<bool> dropped;
-    /// The text a fragment is to be generated from, one document per row - an empty one where the
-    /// row has no text, so that the documents stay aligned with the rows.
-    std::vector<sstring> documents;
+/// One search's answer, and where each of the things it says about a row is delivered.
+struct search_answer_request {
+    /// What the index answered: its candidate keys, in the order it ranked them.
+    const vector_search::vector_store_client::primary_keys& results;
+    /// The slots reporting what it said about a row.  A search the query only ranks by has none.
+    std::optional<size_t> score_slot;
+    std::optional<size_t> rank_slot;
+    /// Non-null when an excerpt of this column's text is wanted, which the text has to be collected
+    /// for.  Only a full-text search has one.
+    const column_definition* document_column = nullptr;
 };
 
-/// Lines an external search's response up with the rows just read.
+/// What the searches have to say about each row of a base-table read, in the order the rows will be
+/// emitted.
+struct search_answers {
+    /// Ready to hand to a provider: one entry per slot asked for, holding that slot's value for
+    /// every row.
+    std::vector<std::pair<size_t, std::vector<cql3::raw_value>>> slots;
+    /// The rows to leave out of the result set, because no search turned out to have anything to
+    /// say about them: every index that named the key has since lost the row, or scored it with
+    /// something that is not a number.
+    std::vector<bool> dropped;
+    /// The text an excerpt is to be generated from, one document per row - an empty one where the
+    /// row has no text, so that the documents stay aligned with the rows.  One entry per request,
+    /// in the order the requests were given, empty for a request wanting no excerpt.
+    std::vector<std::vector<sstring>> documents;
+};
+
+/// Lines what every search answered up with the rows just read.
 ///
-/// `results` is what the index answered.  Given a `score_slot` or a `rank_slot`, every row is
-/// matched against it by primary key and what it says about the row reported under those slots, and
-/// a row with no match is reported as one to drop.  `document_column`, when given, has its text
-/// collected from every row, for a second request asking the index to mark the search's terms in it.
+/// Each row is looked up by primary key in each search's answer and what that search said about it
+/// reported under that search's slots, with nulls where a search did not find it.  A row no search
+/// found is reported as one to drop.
+///
+/// By key rather than by walking each answer in step with the rows: the rows can only be read in one
+/// order, and with more than one search that order is at most one of theirs.
 search_answers match_search_results(const query::result& rows, const query::partition_slice& slice, const schema& schema,
-        const selection::selection& selection, const vector_search::vector_store_client::primary_keys& results,
-        std::optional<size_t> score_slot, std::optional<size_t> rank_slot, const column_definition* document_column);
+        const selection::selection& selection, std::span<const search_answer_request> requests);
 
 /// The values an external search injects into the rows of its result set: one per slot per row,
 /// computed by match_search_results() before the result set is built.  A pure lookup - it hands out
