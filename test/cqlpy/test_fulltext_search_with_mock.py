@@ -361,3 +361,136 @@ def test_bm25_in_select_with_aggregate_rejected(cql, fts_table, vector_store_moc
             cql.execute(
                 f"SELECT {select} FROM {table} "
                 f"WHERE BM25(content, 'hello') > 0 ORDER BY BM25(content, 'hello') LIMIT 5")
+
+
+###############################################################################
+# What a search answers with: a score and a rank.
+#
+# BM25() reports both as a (score, rank) pair; BM25_SCORE() and BM25_RANK()
+# report the halves. All three name the same search, so a query writing several
+# of them still costs one request.
+###############################################################################
+
+def test_bm25_reports_score_and_rank_as_a_pair(cql, fts_table, vector_store_mock):
+    """BM25() answers with the score the index gave the row and the rank that score put it at."""
+    table, _ = fts_table
+
+    mock_data = [(4, 2.25), (3, 1.75), (2, 1.25), (1, 0.75), (0, 0.25)]
+    vector_store_mock.set_next_bm25_response(200, bm25_response(
+        [id for id, _ in mock_data], scores=[s for _, s in mock_data]))
+
+    rows = list(cql.execute(
+        f"SELECT id, BM25(content, 'hello') AS hit FROM {table} "
+        f"WHERE BM25(content, 'hello') > 0 ORDER BY BM25(content, 'hello') LIMIT {len(mock_data)}"))
+
+    assert len(rows) == len(mock_data)
+    # The rank is the position in the index's answer, counted from 1.
+    for rank, (row, (rid, score)) in enumerate(zip(rows, mock_data), start=1):
+        assert row.id == rid
+        assert row.hit[0] == pytest.approx(score)
+        assert row.hit[1] == rank
+
+
+def test_bm25_halves_agree_with_the_pair(cql, fts_table, vector_store_mock):
+    """BM25_SCORE() and BM25_RANK() report exactly the two halves of what BM25() reports."""
+    table, _ = fts_table
+
+    mock_data = [(2, 3.5), (0, 2.5), (4, 1.5)]
+    vector_store_mock.set_next_bm25_response(200, bm25_response(
+        [id for id, _ in mock_data], scores=[s for _, s in mock_data]))
+
+    rows = list(cql.execute(
+        f"SELECT id, BM25(content, 'hello') AS hit, BM25_SCORE(content, 'hello') AS s, "
+        f"BM25_RANK(content, 'hello') AS r FROM {table} "
+        f"WHERE BM25(content, 'hello') > 0 ORDER BY BM25(content, 'hello') LIMIT {len(mock_data)}"))
+
+    assert [row.id for row in rows] == [id for id, _ in mock_data]
+    for rank, (row, (_, score)) in enumerate(zip(rows, mock_data), start=1):
+        assert row.s == pytest.approx(score)
+        assert row.r == rank
+        assert row.hit[0] == pytest.approx(row.s)
+        assert row.hit[1] == row.r
+
+
+def test_bm25_every_reading_costs_one_request(cql, fts_table, vector_store_mock):
+    """All three readings name the one search the rows are ranked by, so they are served by one request."""
+    table, _ = fts_table
+
+    vector_store_mock.set_next_bm25_response(200, bm25_response(RESPONSE_PK_REVERSED))
+    before = len(vector_store_mock.bm25_requests)
+
+    list(cql.execute(
+        f"SELECT id, BM25(content, 'hello'), BM25_SCORE(content, 'hello'), BM25_RANK(content, 'hello') "
+        f"FROM {table} WHERE BM25(content, 'hello') > 0 "
+        f"ORDER BY BM25(content, 'hello') LIMIT {NUM_ROWS}"))
+
+    assert len(vector_store_mock.bm25_requests) - before == 1
+
+
+def test_bm25_rank_skips_stale_keys(cql, fts_table, vector_store_mock):
+    """A key the index still knows but the base table no longer has takes a rank with it.
+
+    The rank is the position in the index's answer, not in the result set, so a row
+    following a stale key keeps the rank the index gave it rather than closing the gap.
+    """
+    table, _ = fts_table
+
+    # id=99 is not in the table. It occupies rank 3 all the same.
+    mock_data = [(4, 2.25), (3, 1.75), (99, 1.50), (2, 1.25), (0, 0.25)]
+    expected = [(4, 1), (3, 2), (2, 4), (0, 5)]
+    vector_store_mock.set_next_bm25_response(200, bm25_response(
+        [id for id, _ in mock_data], scores=[s for _, s in mock_data]))
+
+    rows = list(cql.execute(
+        f"SELECT id, BM25_RANK(content, 'hello') AS r FROM {table} "
+        f"WHERE BM25(content, 'hello') > 0 ORDER BY BM25(content, 'hello') LIMIT {len(mock_data)}"))
+
+    assert [(row.id, row.r) for row in rows] == expected
+
+
+def test_bm25_unaliased_reading_column_names(cql, fts_setup_with_mock):
+    """Each reading is named after the call the user wrote, not after what it was lowered to."""
+    table, _ = fts_setup_with_mock
+
+    rows = list(cql.execute(
+        f"SELECT BM25(content, 'hello'), BM25_SCORE(content, 'hello'), BM25_RANK(content, 'hello') "
+        f"FROM {table} WHERE BM25(content, 'hello') > 0 "
+        f"ORDER BY BM25(content, 'hello') LIMIT {NUM_ROWS}"))
+
+    names = rows[0]._fields
+    assert not any("temporary" in name for name in names), f"Internal name leaked: {names}"
+    assert len(names) == 3, names
+    assert "bm25_score" in names[1] and "bm25_rank" in names[2], names
+    # The pair is named after the call too, not after the tuple of slots it became.
+    assert "bm25" in names[0] and "score" not in names[0] and "rank" not in names[0], names
+
+
+def test_bm25_where_compares_the_score(cql, fts_setup_with_mock):
+    """A relation on the search compares its score, however the search is named in it."""
+    table, _ = fts_setup_with_mock
+
+    for lhs in ["BM25(content, 'hello')", "BM25_SCORE(content, 'hello')"]:
+        vector_store_mock_rows = list(cql.execute(
+            f"SELECT id FROM {table} WHERE {lhs} > 0 "
+            f"ORDER BY BM25(content, 'hello') LIMIT {NUM_ROWS}"))
+        assert len(vector_store_mock_rows) == NUM_ROWS
+
+
+def test_bm25_rank_cannot_be_compared(cql, fts_table):
+    """A rank has no threshold that means anything, so a relation on one is refused."""
+    table, _ = fts_table
+
+    with pytest.raises(InvalidRequest, match="nothing a relation can compare"):
+        cql.execute(f"SELECT id FROM {table} WHERE BM25_RANK(content, 'hello') > 3 "
+                    f"ORDER BY BM25(content, 'hello') LIMIT {NUM_ROWS}")
+
+
+def test_bm25_where_still_rejects_other_comparisons(cql, fts_table):
+    """Rewriting the relation to the score must not have loosened what it accepts."""
+    table, _ = fts_table
+
+    for where in ["BM25(content, 'hello') >= 0", "BM25(content, 'hello') > 1",
+                  "BM25_SCORE(content, 'hello') >= 0", "BM25_SCORE(content, 'hello') > 1"]:
+        with pytest.raises(InvalidRequest):
+            cql.execute(f"SELECT id FROM {table} WHERE {where} "
+                        f"ORDER BY BM25(content, 'hello') LIMIT {NUM_ROWS}")

@@ -632,3 +632,86 @@ def test_rescoring_filters_and_orders_with_where_clause_ann_function(cql, test_k
         for row, d_row in zip(rows, data[:3]):
             assert row.similarity == pytest.approx(d_row.expected_similarity, abs=0.01)
         assert len(rows[0]) == 2
+
+
+# ---------------------------------------------------------------------------
+# What a vector search answers with: a score and a rank
+# ---------------------------------------------------------------------------
+#
+# ANN() reports both as a (score, rank) pair; ANN_SCORE() and ANN_RANK() report
+# the halves. A rescoring index reorders the rows by a score it recomputes, so
+# the rank the Vector Store gave them is the rank of an order they are no longer
+# in and it reports 0 instead - a placeholder, pinned here so that giving it a
+# real value is a visible change.
+
+def test_without_rescoring_ann_reports_score_and_rank_as_a_pair(cql, test_keyspace, vector_store_mock, skip_without_tablets):
+    """ANN() answers with the Vector Store's score and the rank it gave the row."""
+    data = TEST_DATA["cosine"]
+    with rescoring_test_table(cql, test_keyspace, data,
+            extra_options={"rescoring": "false"}) as table:
+        vector_store_mock.set_next_ann_response(200, reversed_ann_response(data))
+        rows = list(cql.execute(
+            f"SELECT id, ANN(embedding, {ANN_QUERY_VECTOR_LITERAL}) AS hit, "
+            f"ANN_SCORE(embedding, {ANN_QUERY_VECTOR_LITERAL}) AS s, "
+            f"ANN_RANK(embedding, {ANN_QUERY_VECTOR_LITERAL}) AS r FROM {table} "
+            f"ORDER BY ANN(embedding, {ANN_QUERY_VECTOR_LITERAL}) LIMIT 2"))
+
+        assert [row.s for row in rows] == pytest.approx([0.04, 0.03], abs=0.001)
+        # The rank is the position in the Vector Store's answer, counted from 1.
+        assert [row.r for row in rows] == [1, 2]
+        for row in rows:
+            assert row.hit[0] == pytest.approx(row.s, abs=0.001)
+            assert row.hit[1] == row.r
+
+
+def test_without_rescoring_every_reading_costs_one_request(cql, test_keyspace, vector_store_mock, skip_without_tablets):
+    """All three readings name the one search the rows are ranked by, so they are served by one request."""
+    data = TEST_DATA["cosine"]
+    with rescoring_test_table(cql, test_keyspace, data,
+            extra_options={"rescoring": "false"}) as table:
+        vector_store_mock.set_next_ann_response(200, reversed_ann_response(data))
+        before = len(vector_store_mock.ann_requests)
+        list(cql.execute(
+            f"SELECT id, ANN(embedding, {ANN_QUERY_VECTOR_LITERAL}), "
+            f"ANN_SCORE(embedding, {ANN_QUERY_VECTOR_LITERAL}), "
+            f"ANN_RANK(embedding, {ANN_QUERY_VECTOR_LITERAL}) FROM {table} "
+            f"ORDER BY ANN(embedding, {ANN_QUERY_VECTOR_LITERAL}) LIMIT 2"))
+
+        assert len(vector_store_mock.ann_requests) - before == 1
+
+
+def test_with_rescoring_ann_reports_the_recomputed_score_and_no_rank(cql, test_keyspace, vector_store_mock, skip_without_tablets):
+    """A rescoring index reports the similarity it recomputed, and 0 for the rank.
+
+    The rows are reordered by the recomputed score, so the Vector Store's rank is
+    the rank of an order they are no longer in. Reporting it would be a wrong
+    answer rather than a partial one, and the rank in the recomputed order needs
+    every row's score at once, which nothing on this path holds. 0 is outside the
+    range a rank occupies, so it says "not reported" rather than "not found".
+    """
+    data = TEST_DATA["cosine"]
+    with rescoring_test_table(cql, test_keyspace, data) as table:
+        vector_store_mock.set_next_ann_response(200, reversed_ann_response(data))
+        rows = list(cql.execute(
+            f"SELECT id, ANN(embedding, {ANN_QUERY_VECTOR_LITERAL}) AS hit, "
+            f"ANN_SCORE(embedding, {ANN_QUERY_VECTOR_LITERAL}) AS s, "
+            f"ANN_RANK(embedding, {ANN_QUERY_VECTOR_LITERAL}) AS r FROM {table} "
+            f"ORDER BY ANN(embedding, {ANN_QUERY_VECTOR_LITERAL}) LIMIT {len(data)}"))
+
+        # Rescoring puts the rows back in the recomputed order, not the mock's.
+        assert [row.id for row in rows] == [d_row.id for d_row in data]
+        for row, d_row in zip(rows, data):
+            assert row.s == pytest.approx(d_row.expected_similarity, abs=0.01)
+            assert row.r == 0
+            assert row.hit[0] == pytest.approx(row.s, abs=0.01)
+            assert row.hit[1] == 0
+
+
+def test_ann_rank_cannot_be_compared(cql, test_keyspace, vector_store_mock, skip_without_tablets):
+    """A rank has no threshold that means anything, so a relation on one is refused."""
+    data = TEST_DATA["cosine"]
+    with rescoring_test_table(cql, test_keyspace, data) as table:
+        with pytest.raises(InvalidRequest, match="nothing a relation can compare"):
+            cql.execute(f"SELECT id FROM {table} "
+                        f"WHERE ANN_RANK(embedding, {ANN_QUERY_VECTOR_LITERAL}) > 3 "
+                        f"ORDER BY ANN(embedding, {ANN_QUERY_VECTOR_LITERAL}) LIMIT 2")
