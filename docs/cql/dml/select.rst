@@ -401,19 +401,33 @@ in this case ``[0.1, 0.2, 0.3, 0.4]``. Written with the function form, it is::
     SELECT image_id FROM ImageEmbeddings
       ORDER BY ANN(embedding, [0.1, 0.2, 0.3, 0.4]) LIMIT 5;
 
-``ANN()`` may also be used as a selector, to return the similarity score of each row::
+``ANN()`` may also be used as a selector, to return what the search said about each row::
 
-    SELECT image_id, ANN(embedding, [0.1, 0.2, 0.3, 0.4]) AS similarity
+    SELECT image_id, ANN(embedding, [0.1, 0.2, 0.3, 0.4]) AS hit
       FROM ImageEmbeddings
       ORDER BY ANN(embedding, [0.1, 0.2, 0.3, 0.4]) LIMIT 5;
 
-It is the score the rows are ranked by, so it is only accepted in a query that already orders by
-an ANN clause, and every occurrence must name the same column and the same query vector as that
-clause. Where the score comes from depends on the index: it is the one the Vector Store reported,
+It answers with a ``tuple<float, int>``: the **similarity** the index gave the row, and the **rank**
+that similarity put the row at, counted from 1. ``ANN_SCORE()`` and ``ANN_RANK()`` name the two
+halves on their own::
+
+    SELECT image_id, ANN_SCORE(embedding, [0.1, 0.2, 0.3, 0.4]) AS similarity
+      FROM ImageEmbeddings
+      ORDER BY ANN(embedding, [0.1, 0.2, 0.3, 0.4]) LIMIT 5;
+
+All three describe the score the rows are ranked by, so each is only accepted in a query that
+already orders by an ANN clause, and every occurrence must name the same column and the same query
+vector as that clause. A query writing several of them still makes a single request.
+
+Where the similarity comes from depends on the index: it is the one the Vector Store reported,
 unless the index is configured for
 :ref:`rescoring <create-vector-index-statement>` - which also requires a quantization below
 ``f32`` - in which case it is the similarity recomputed from the stored vector, the value the rows
 were reordered by.
+
+A rescoring index reports a rank of ``0``. Having reordered the rows by the recomputed similarity,
+the rank the Vector Store gave them is the rank of an order they are no longer in, and ``0`` - which
+no real rank takes - says the rank is not reported rather than that the row was not found.
 
 To score rows against a vector other than the one being searched for, use the
 :ref:`similarity functions <vector-similarity-functions>` directly.
@@ -506,9 +520,11 @@ the built-in operator as ``system.bm25(...)`` to disambiguate it.
 
 .. note::
 
-   ``BM25()`` may also be used as a selector, to return the relevance score of each row. It is
-   only accepted there in a query that already has the required ``WHERE`` and ``ORDER BY``
-   clauses, and every occurrence must reference the same column and the same search term.
+   ``BM25()`` may also be used as a selector, to return the ``(score, rank)`` pair the search
+   answers with for each row; ``BM25_SCORE()`` and ``BM25_RANK()`` name the halves. Each is only
+   accepted there in a query that already has the required ``WHERE`` and ``ORDER BY`` clauses, and
+   every occurrence must reference the same column and the same search term. A relation in the
+   ``WHERE`` clause compares the score; a rank cannot be compared at all.
 
 For the full list of query constraints and requirements, see
 :doc:`Full-Text Search </features/fulltext-search>`.
