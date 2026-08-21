@@ -21,9 +21,12 @@ struct ann_ordering_info {
     secondary_index::index index;
     raw::select_statement::prepared_ann_ordering_type prepared_ann_ordering;
     bool is_rescoring_enabled;
-    /// Temporary slot the Vector Store's own score is delivered in, allocated on the first ann()
-    /// occurrence in SELECT and filled per row by external_score_provider.
-    std::optional<size_t> temporary_index;
+    /// Temporary slots the search's two readings are delivered in, allocated on the first SELECT
+    /// occurrence naming each and filled per row by external_score_provider.  A rescoring index
+    /// fills neither: it recomputes the score locally, and has no rank to report until the
+    /// recomputed scores are ranked.
+    std::optional<size_t> score_temporary_index;
+    std::optional<size_t> rank_temporary_index;
     /// The SELECT occurrences' query vectors that only execution can compare, a bind marker
     /// standing where at least one of the two values will be.
     std::vector<expr::expression> deferred_select_vectors;
@@ -36,11 +39,12 @@ std::optional<ann_ordering_info> get_ann_ordering_info(
         schema_ptr schema,
         const expr::function_call& fc);
 
-/// Lowers every ANN() call in the SELECT clause, nested occurrences included, to where the row's
-/// score comes from: the slot the Vector Store's score is delivered in, or the similarity the
-/// coordinator recomputes when the index rescores.  Rejects an occurrence with no ANN ordering to
-/// agree with, or one that disagrees with it on the column or the query vector; a disagreement only
-/// execution can settle is recorded in ordering_info for it to check.
+/// Lowers every call to the ANN family in the SELECT clause, nested occurrences included, to where
+/// each reading of the row comes from: the slots the Vector Store's score and rank are delivered
+/// in, or - when the index rescores - the similarity the coordinator recomputes and a rank it
+/// cannot yet report.  Rejects an occurrence with no ANN ordering to agree with, or one that
+/// disagrees with it on the column or the query vector; a disagreement only execution can settle is
+/// recorded in ordering_info for it to check.
 void prepare_ann_selectors(std::vector<selection::prepared_selector>& prepared_selectors,
         std::optional<ann_ordering_info>& ordering_info, expr::temporary_allocator& temporaries_allocator,
         data_dictionary::database db, const schema_ptr& schema, prepare_context& ctx);

@@ -17,14 +17,22 @@
 #include "types/types.hh"
 #include "utils/log.hh"
 
+#include <seastar/core/on_internal_error.hh>
+
 namespace cql3::statements {
 
-external_score_provider::external_score_provider(const vector_search::vector_store_client::primary_keys& results, size_t score_slot,
-        const schema& schema)
+static logging::logger vs_log("external_score_provider");
+
+external_score_provider::external_score_provider(const vector_search::vector_store_client::primary_keys& results,
+        std::optional<size_t> score_slot, std::optional<size_t> rank_slot, const schema& schema)
     : _results(results)
     , _next_result(0)
     , _score_slot(score_slot)
+    , _rank_slot(rank_slot)
     , _schema(schema) {
+    if (!_score_slot && !_rank_slot) {
+        on_internal_error(vs_log, "an external score provider was built with no slot to fill");
+    }
 }
 
 bool external_score_provider::try_fill(std::vector<cql3::raw_value>& temporaries, std::span<const bytes> partition_key,
@@ -52,6 +60,8 @@ bool external_score_provider::try_fill(std::vector<cql3::raw_value>& temporaries
         }
 
         float score = vs_result.similarity;
+        // The rank the index gave this row is where its entry sits in the response, counted from 1.
+        auto rank = static_cast<int32_t>(_next_result + 1);
         ++_next_result;
 
         // Vector store can't return Inf over JSON API.
@@ -61,7 +71,12 @@ bool external_score_provider::try_fill(std::vector<cql3::raw_value>& temporaries
             return false;
         }
 
-        temporaries[_score_slot] = cql3::raw_value::make_value(float_type->decompose(score));
+        if (_score_slot) {
+            temporaries[*_score_slot] = cql3::raw_value::make_value(float_type->decompose(score));
+        }
+        if (_rank_slot) {
+            temporaries[*_rank_slot] = cql3::raw_value::make_value(int32_type->decompose(rank));
+        }
         return true;
     }
 

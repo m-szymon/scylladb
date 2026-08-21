@@ -8,6 +8,8 @@
 
 #include "scoring_fcts.hh"
 #include "native_scalar_function.hh"
+#include "types/tuple.hh"
+#include "types/types.hh"
 #include "utils/log.hh"
 #include <seastar/core/on_internal_error.hh>
 
@@ -16,30 +18,94 @@ namespace functions {
 
 extern logging::logger log;
 
-shared_ptr<function> make_bm25_function() {
-    // BM25 fulltext scoring function: bm25(column, query) -> float
-    // Registered with utf8_type args; ascii is implicitly coerced to utf8 by the type system.
-    //
-    // BM25 scores depend on document statistics, so the result is not determined by the visible arguments alone.
-    // Marked as non-pure (false) to prevent the expression evaluator from constant-folding BM25(literal, literal)
-    // at prepare time, which is both semantically correct and avoids a spurious crash path.
-    return make_native_scalar_function<false>(BM25_FUNCTION_NAME.name, float_type, {utf8_type, utf8_type},
-        [] (std::span<const bytes_opt>) -> bytes_opt {
-            // A BM25() call is always resolved at prepare time, so this body is never reached.
-            on_internal_error(log, "BM25() reached scalar evaluation; prepare-time handling should have prevented this");
-        });
+namespace {
+
+/// A native scalar function whose value comes from an external search system rather than from
+/// evaluating its arguments locally.
+///
+/// Being external implies the two invariants every such function needs, so they are stated here
+/// once instead of once per function:
+///  - non-pure, so that the expression evaluator does not constant-fold a call whose arguments
+///    happen to all be literals before statement preparation gets to claim it;
+///  - no evaluation of its own: preparation either lowers the call to a value injected per row or
+///    rejects the clause it appears in, so reaching this body is a bug.
+class external_scalar_function : public native_scalar_function {
+    // The reading a relation on this function compares, null when there is none.  Held rather than
+    // computed, because a relation needs it before anything has decided which search this is.
+    const function_name* _comparison_reading;
+
+public:
+    external_scalar_function(sstring name, data_type return_type, std::vector<data_type> arg_types,
+            const function_name* comparison_reading)
+        : native_scalar_function(std::move(name), std::move(return_type), std::move(arg_types))
+        , _comparison_reading(comparison_reading) {
+    }
+
+    const function_name* comparison_reading() const override {
+        return _comparison_reading;
+    }
+
+    bool is_pure() const override {
+        return false;
+    }
+
+    bool is_external() const override {
+        return true;
+    }
+
+    bytes_opt execute(std::span<const bytes_opt>) override {
+        on_internal_error(log, format("{}() reached scalar evaluation; prepare-time handling should have prevented this", name()));
+    }
+};
+
+/// The type each reading of the ANN family answers with.
+data_type ann_return_type(const function_name& name) {
+    if (name == ANN_SCORE_FUNCTION_NAME) {
+        return float_type;
+    }
+    if (name == ANN_RANK_FUNCTION_NAME) {
+        return int32_type;
+    }
+    return search_hit_type();
 }
 
-shared_ptr<function> make_ann_function(const std::vector<data_type>& arg_types) {
-    // ANN vector ordering function: ann(column, query_vector) -> float
-    //
-    // Marked as non-pure (false) for the same reason as BM25(): it must not be constant-folded
-    // when both arguments happen to be literals.
-    return make_native_scalar_function<false>(ANN_FUNCTION_NAME.name, float_type, arg_types,
-        [] (std::span<const bytes_opt>) -> bytes_opt {
-            // An ANN() call is always resolved at prepare time, so this body is never reached.
-            on_internal_error(log, "ANN() reached scalar evaluation; prepare-time handling should have prevented this");
-        });
+/// What a relation on an ANN-family call compares.  The score, for the pair and for itself; a rank
+/// has no threshold that means anything, so nothing at all.
+const function_name* ann_comparison_reading(const function_name& name) {
+    return name == ANN_RANK_FUNCTION_NAME ? nullptr : &ANN_SCORE_FUNCTION_NAME;
+}
+
+} // anonymous namespace
+
+data_type search_hit_type() {
+    // Interned by the type registry, so asking for it per call costs a lookup rather than a type.
+    return tuple_type_impl::get_instance({float_type, int32_type});
+}
+
+bool is_ann_function_name(const function_name& name) {
+    return name == ANN_FUNCTION_NAME || name == ANN_SCORE_FUNCTION_NAME || name == ANN_RANK_FUNCTION_NAME;
+}
+
+shared_ptr<function> make_bm25_function() {
+    // Full-text search: bm25(column, query) -> (score, rank)
+    // Registered with utf8_type args; ascii is implicitly coerced to utf8 by the type system.
+    return ::make_shared<external_scalar_function>(BM25_FUNCTION_NAME.name, search_hit_type(),
+            std::vector<data_type>{utf8_type, utf8_type}, &BM25_SCORE_FUNCTION_NAME);
+}
+
+shared_ptr<function> make_bm25_score_function() {
+    return ::make_shared<external_scalar_function>(BM25_SCORE_FUNCTION_NAME.name, float_type,
+            std::vector<data_type>{utf8_type, utf8_type}, &BM25_SCORE_FUNCTION_NAME);
+}
+
+shared_ptr<function> make_bm25_rank_function() {
+    return ::make_shared<external_scalar_function>(BM25_RANK_FUNCTION_NAME.name, int32_type,
+            std::vector<data_type>{utf8_type, utf8_type}, nullptr);
+}
+
+shared_ptr<function> make_ann_function(const function_name& name, const std::vector<data_type>& arg_types) {
+    // Vector search: ann(column, query_vector) -> (score, rank), and its two halves.
+    return ::make_shared<external_scalar_function>(name.name, ann_return_type(name), arg_types, ann_comparison_reading(name));
 }
 
 } // namespace functions

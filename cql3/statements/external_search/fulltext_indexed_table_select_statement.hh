@@ -18,9 +18,11 @@ namespace cql3::statements {
 struct bm25_ordering_info {
     secondary_index::index index;
     expr::expression search_term;
-    // Temporary slot the score is delivered in, allocated on the first bm25()
-    // occurrence in SELECT and filled per row by external_score_provider.
-    std::optional<size_t> temporary_index;
+    // Temporary slots the search's two readings are delivered in, allocated on the first SELECT
+    // occurrence naming each and filled per row by external_score_provider.  One slot per reading
+    // serves every occurrence of it, since all of them are required to name the same search.
+    std::optional<size_t> score_temporary_index;
+    std::optional<size_t> rank_temporary_index;
     // The SELECT occurrences' search terms that only execution can compare, a bind marker standing
     // where at least one of the two values will be.
     std::vector<expr::expression> deferred_select_terms;
@@ -35,11 +37,11 @@ std::optional<bm25_ordering_info> get_bm25_ordering_info(
         schema_ptr schema,
         const expr::function_call& fc);
 
-/// Lowers every bm25() call in the SELECT clause, nested occurrences included, to the slot the
-/// row's score is delivered in, allocating it on the first one.  Rejects an occurrence with no
-/// BM25 ordering and WHERE clause to agree with, or one that disagrees with them on the column or
-/// the search term; a disagreement only execution can settle is recorded in ordering_info for it
-/// to check.
+/// Lowers every call to the BM25 family in the SELECT clause, nested occurrences included, to the
+/// slots the row's score and rank are delivered in, allocating each on the first occurrence that
+/// asks for it.  Rejects an occurrence with no BM25 ordering and WHERE clause to agree with, or one
+/// that disagrees with them on the column or the search term; a disagreement only execution can
+/// settle is recorded in ordering_info for it to check.
 void prepare_bm25_selectors(std::vector<selection::prepared_selector>& prepared_selectors, std::optional<bm25_ordering_info>& ordering_info,
         expr::temporary_allocator& temporaries_allocator, prepare_context& ctx);
 

@@ -840,8 +840,7 @@ statement_restrictions::statement_restrictions(private_tag,
             // Intercept them so they never enter the generic restriction/index/filtering
             // machinery; whichever external index owns the scoring function interprets them,
             // and select_statement::prepare() rejects any that no index claimed.
-            if (expr::is_native_function_call(*fc, functions::BM25_FUNCTION_NAME)
-                    || expr::is_native_function_call(*fc, functions::ANN_FUNCTION_NAME)) {
+            if (expr::is_external_function_call(*fc)) {
                 if (!type.is_select()) {
                     throw exceptions::invalid_request_exception("Scoring functions are only supported in SELECT statements");
                 }
