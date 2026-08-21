@@ -44,6 +44,7 @@ size_t column_index_in(const selection::selection& selection, const column_defin
 /// What one walk over the rows produces, before it is arranged into search_answers.
 struct matched_rows {
     std::vector<cql3::raw_value> scores;
+    std::vector<cql3::raw_value> ranks;
     std::vector<bool> dropped;
     std::vector<sstring> documents;
 };
@@ -63,7 +64,7 @@ class result_matcher {
     // position, and an entry stepped over is a key the index still knows about but that is no longer
     // in the base table.
     const vector_search::vector_store_client::primary_keys& _results;
-    const bool _match_scores;
+    const bool _match_answers;
     size_t _next_result = 0;
 
     // The text a fragment is to be generated from.  The index stores none of it, which is why it has
@@ -77,8 +78,12 @@ class result_matcher {
     clustering_key_prefix _clustering_key = clustering_key_prefix::make_empty();
     uint64_t _row_count = 0;
 
-    void match_score() {
+    void match_answer() {
         while (_next_result < _results.size()) {
+            // The rank is where this entry sits in the response, counted from 1 - a position in what
+            // the index answered, not in the result set, so an entry stepped over takes its rank
+            // with it rather than the ranks after it closing up.
+            const auto rank = static_cast<int32_t>(_next_result + 1);
             const auto& result = _results[_next_result++];
 
             if (!result.partition.key().equal(_schema, _partition_key)) {
@@ -95,11 +100,13 @@ class result_matcher {
             }
 
             _matched.scores.push_back(cql3::raw_value::make_value(float_type->decompose(result.similarity)));
+            _matched.ranks.push_back(cql3::raw_value::make_value(int32_type->decompose(rank)));
             _matched.dropped.push_back(false);
             return;
         }
 
         _matched.scores.push_back(cql3::raw_value::make_null());
+        _matched.ranks.push_back(cql3::raw_value::make_null());
         _matched.dropped.push_back(true);
     }
 
@@ -120,8 +127,8 @@ class result_matcher {
     }
 
     void visit(const query::result_row_view& static_row, const query::result_row_view* row) {
-        if (_match_scores) {
-            match_score();
+        if (_match_answers) {
+            match_answer();
         }
         if (_document_column) {
             collect_document(static_row, row);
@@ -130,12 +137,12 @@ class result_matcher {
 
 public:
     result_matcher(const schema& schema, const selection::selection& selection,
-            const vector_search::vector_store_client::primary_keys& results, bool match_scores, const column_definition* document_column,
+            const vector_search::vector_store_client::primary_keys& results, bool match_answers, const column_definition* document_column,
             matched_rows& matched)
         : _schema(schema)
         , _selection(selection)
         , _results(results)
-        , _match_scores(match_scores)
+        , _match_answers(match_answers)
         , _document_column(document_column)
         , _document_index(document_column ? column_index_in(selection, *document_column) : 0)
         , _matched(matched) {
@@ -175,13 +182,18 @@ public:
 
 search_answers match_search_results(const query::result& rows, const query::partition_slice& slice, const schema& schema,
         const selection::selection& selection, const vector_search::vector_store_client::primary_keys& results,
-        std::optional<size_t> score_slot, const column_definition* document_column) {
+        std::optional<size_t> score_slot, std::optional<size_t> rank_slot, const column_definition* document_column) {
+    // Both readings come out of the one match, so the walk collects them whenever either is wanted.
+    const bool match_answers = score_slot || rank_slot;
     auto matched = matched_rows{};
-    query::result_view::consume(rows, slice, result_matcher(schema, selection, results, bool(score_slot), document_column, matched));
+    query::result_view::consume(rows, slice, result_matcher(schema, selection, results, match_answers, document_column, matched));
 
     auto answers = search_answers{.dropped = std::move(matched.dropped), .documents = std::move(matched.documents)};
     if (score_slot) {
         answers.slots.emplace_back(*score_slot, std::move(matched.scores));
+    }
+    if (rank_slot) {
+        answers.slots.emplace_back(*rank_slot, std::move(matched.ranks));
     }
     return answers;
 }

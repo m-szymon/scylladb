@@ -76,15 +76,36 @@ In the ``WHERE`` clause, ``>`` is the only supported operator and the right-hand
 side must be the literal ``0``. Operators such as ``>=``, ``=``, ``<``, ``<=``,
 and ``!=`` are rejected, as is any non-zero threshold.
 
-``BM25()`` may also be selected, to return the relevance score of each row::
+A relation compares the search's **score**, so ``WHERE BM25(v, 'search term') > 0`` and
+``WHERE BM25_SCORE(v, 'search term') > 0`` mean the same thing. ``BM25_RANK()`` cannot appear in a
+relation at all: a threshold on a rank means nothing.
 
-    SELECT id, BM25(v, 'search term') AS score FROM ks.t
+``BM25()`` may also be selected, to return what the search said about each row::
+
+    SELECT id, BM25(v, 'search term') AS hit FROM ks.t
         WHERE BM25(v, 'search term') > 0
         ORDER BY BM25(v, 'search term')
         LIMIT 10;
 
-It is the score the rows are ranked by, so it needs the two clauses above and has to reference the
-same column and the same search term they do.
+It answers with a ``tuple<float, int>``: the **score** the index gave the row, and the **rank** that
+score put the row at among the rows the search returned, counted from 1. The rank is not recoverable
+from the score, because scores of different searches are not on one scale while their ranks are.
+
+The two halves can be named on their own, which is usually what a query wants::
+
+    SELECT id, BM25_SCORE(v, 'search term') AS score, BM25_RANK(v, 'search term') AS rank
+        FROM ks.t
+        WHERE BM25(v, 'search term') > 0
+        ORDER BY BM25(v, 'search term')
+        LIMIT 10;
+
+All three describe the one search the rows are ranked by, so each needs the two clauses above and
+has to reference the same column and the same search term they do - and a query writing several of
+them still makes a single request.
+
+A rank is the position in the index's answer, not in the result set. If the index names a row that
+is no longer in the base table, the rank it occupied is simply missing from the result rather than
+being closed up.
 
 Highlighting
 ~~~~~~~~~~~~

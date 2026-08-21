@@ -25,6 +25,7 @@
 #include "schema/schema.hh"
 #include "types/types.hh"
 #include "utils/assert.hh"
+#include "utils/log.hh"
 
 #include <seastar/core/future.hh>
 #include <seastar/coroutine/exception.hh>
@@ -33,48 +34,102 @@
 
 namespace cql3::statements {
 
+static logging::logger fts_log("fulltext_search");
+
 namespace {
 
-/// One of the two values a full-text search reports, as a SELECT occurrence can ask for it.  Both
-/// are read from the one search the rows are ranked by and validated by the one set of rules in
-/// prepare_bm25_selectors(); this is everything that differs between them.
+/// One of the values a full-text search reports, as it reaches a row: which slot delivers it, what
+/// type that slot has, and - for a value generated from the row's own text - where to record the
+/// column that text comes from.
 struct bm25_value {
-    /// The function it is called by: what a call is matched against, and what a message about that
-    /// call names.
-    const functions::function_name& function;
-    std::string_view name;
-    /// The type of the temporary slot it is delivered in.  Must be the function's declared return
-    /// type, since that is what the selector reading the slot was typed by.
+    /// Must be the declared return type of the function reporting it on its own, since that is what
+    /// typed the selector reading the slot.
     data_type slot_type;
     /// Where the index of that slot is kept, allocated on the value's first occurrence.
     std::optional<size_t> bm25_ordering_info::*slot;
-    /// Where to record the column the value is computed from, for a value generated from the row's
-    /// own text - which has to be read from every row.  Null for a value the index reports itself.
+    /// Null for a value the index reports itself.
     const column_definition* bm25_ordering_info::*source_column;
 };
 
-/// The value the given call asks for, or std::nullopt when it is not a call to either of them.
+/// What a call to the family names.  Every one of them describes the one search the rows are ranked
+/// by and is validated by the one set of rules in prepare_bm25_selectors(); this is everything that
+/// differs between them.  A call naming the pair the search answers with delivers both of its
+/// halves and combines them, which is why the values are a list.
+struct bm25_selection {
+    /// The name a message about the call names it by.
+    std::string_view name;
+    std::vector<bm25_value> values;
+    /// What the values are combined into, or null when the call names a single one.
+    data_type combined_type;
+};
+
+/// What the given call names, or std::nullopt when it is not a call to the family.
 ///
-/// The table is built per call rather than kept in a static: a data_type is thread_local, one
+/// The values are built per call rather than kept in a static: a data_type is thread_local, one
 /// instance per shard, so a table shared between shards would hand every shard the types of
 /// whichever one built it first.
-std::optional<bm25_value> selected_bm25_value(const expr::function_call& fc) {
-    const bm25_value values[] = {
-            {functions::BM25_FUNCTION_NAME, "BM25", float_type, &bm25_ordering_info::score_temporary_index, nullptr},
-            {functions::BM25_HIGHLIGHT_FUNCTION_NAME, "BM25_HIGHLIGHT", utf8_type, &bm25_ordering_info::highlight_temporary_index,
-                    &bm25_ordering_info::highlighted_column},
+std::optional<bm25_selection> selected_bm25_value(const expr::function_call& fc) {
+    const bm25_value score{float_type, &bm25_ordering_info::score_temporary_index, nullptr};
+    const bm25_value rank{int32_type, &bm25_ordering_info::rank_temporary_index, nullptr};
+    const bm25_value fragment{utf8_type, &bm25_ordering_info::highlight_temporary_index, &bm25_ordering_info::highlighted_column};
+
+    if (expr::is_native_function_call(fc, functions::BM25_FUNCTION_NAME)) {
+        return bm25_selection{"BM25", {score, rank}, functions::search_hit_type()};
+    }
+    if (expr::is_native_function_call(fc, functions::BM25_SCORE_FUNCTION_NAME)) {
+        return bm25_selection{"BM25_SCORE", {score}, nullptr};
+    }
+    if (expr::is_native_function_call(fc, functions::BM25_RANK_FUNCTION_NAME)) {
+        return bm25_selection{"BM25_RANK", {rank}, nullptr};
+    }
+    if (expr::is_native_function_call(fc, functions::BM25_HIGHLIGHT_FUNCTION_NAME)) {
+        return bm25_selection{"BM25_HIGHLIGHT", {fragment}, nullptr};
+    }
+    return std::nullopt;
+}
+
+/// The expression a selection is delivered by, allocating each slot on its first occurrence.  The
+/// slots hold the values themselves even when a call combines them, so naming the pair and naming a
+/// half in one query costs one slot per value rather than one per spelling.
+///
+/// A slot standing for a whole call carries it, so that an unaliased selector is still named after
+/// what the user wrote; the ones inside a combination carry nothing, because none of them is the
+/// call - naming that one is the caller's job.
+expr::expression deliver_bm25_selection(const bm25_selection& selection, const expr::expression& call, const column_definition* col,
+        bm25_ordering_info& info, expr::temporary_allocator& temporaries_allocator) {
+    auto deliver = [&] (const bm25_value& value, std::optional<expr::expression> replaced) {
+        auto& slot = info.*value.slot;
+        if (!slot) {
+            slot = temporaries_allocator.allocate();
+        }
+        if (value.source_column) {
+            // Checked equal to the ranked column by the caller.
+            info.*value.source_column = col;
+        }
+        return expr::expression(expr::temporary{.index = *slot, .type = value.slot_type, .replaced_expr = std::move(replaced)});
     };
-    auto it = std::ranges::find_if(values, [&fc](const bm25_value& value) { return expr::is_native_function_call(fc, value.function); });
-    return it != std::ranges::end(values) ? std::optional<bm25_value>(*it) : std::nullopt;
+
+    if (!selection.combined_type) {
+        return deliver(selection.values.front(), call);
+    }
+    auto elements = std::vector<expr::expression>{};
+    elements.reserve(selection.values.size());
+    for (const auto& value : selection.values) {
+        elements.push_back(deliver(value, std::nullopt));
+    }
+    return expr::expression(expr::tuple_constructor{.elements = std::move(elements), .type = selection.combined_type});
 }
 
 std::optional<expr::expression> validate_bm25_where_restriction(const expr::binary_operator& binop,
         const bm25_ordering_info& ordering_info) {
+    // Whichever of the family the user wrote, preparation rewrote it to the reading a relation
+    // compares, so this is the score.
     const auto& fc = expr::as<expr::function_call>(binop.lhs);
-    if (expr::is_native_function_call(fc, functions::BM25_HIGHLIGHT_FUNCTION_NAME)) {
-        // A fragment is generated from a row the search has already selected, so there is nothing
-        // here to restrict by.
-        throw exceptions::invalid_request_exception("BM25_HIGHLIGHT() is only supported in the SELECT clause");
+    if (!expr::is_native_function_call(fc, functions::BM25_SCORE_FUNCTION_NAME)) {
+        // Not the score, so not this search's relevance: a fragment is generated from a row the
+        // search has already selected, and another search's score does not belong here either.
+        throw exceptions::invalid_request_exception(seastar::format("{}() is not supported in the WHERE clause",
+                std::get<shared_ptr<db::functions::function>>(fc.func)->name().name));
     }
     auto [col, where_term] = external_search::extract_call_arguments(fc, "BM25");
     if (col->name_as_text() != ordering_info.index.target_column()) {
@@ -131,6 +186,11 @@ std::vector<cql3::raw_value> to_values(const vector_search::vector_store_client:
 void prepare_bm25_selectors(std::vector<selection::prepared_selector>& prepared_selectors, std::optional<bm25_ordering_info>& ordering_info,
         expr::temporary_allocator& temporaries_allocator, prepare_context& ctx) {
     for (auto& ps : prepared_selectors) {
+        // What the user wrote, before any of it is lowered - the name an unaliased selector that
+        // named the whole pair has to keep, since a tuple of slots formats as neither call.
+        const auto written = ps.expr;
+        bool named_the_pair = false;
+
         ps.expr = expr::search_and_replace(ps.expr, [&](const expr::expression& candidate) -> std::optional<expr::expression> {
             const auto* fc = expr::as_if<expr::function_call>(&candidate);
             if (!fc) {
@@ -164,21 +224,13 @@ void prepare_bm25_selectors(std::vector<selection::prepared_selector>& prepared_
             }
 
             // Every occurrence of one value reports the same thing, so one slot serves them all.
-            auto& slot = info.*value->slot;
-            if (!slot) {
-                slot = temporaries_allocator.allocate();
-            }
-            if (value->source_column) {
-                // Checked equal to the ranked column just above.
-                info.*value->source_column = col;
-            }
-
-            return expr::expression(expr::temporary{
-                    .index = *slot,
-                    .type = value->slot_type,
-                    .replaced_expr = candidate,
-            });
+            named_the_pair |= bool(value->combined_type);
+            return deliver_bm25_selection(*value, candidate, col, info, temporaries_allocator);
         });
+
+        if (named_the_pair && !ps.alias) {
+            ps.alias = ::make_shared<column_identifier>(fmt::format("{:result_set_metadata}", written), true);
+        }
     }
 }
 
@@ -249,9 +301,9 @@ std::optional<bm25_ordering_info> get_bm25_ordering_info(
                 "Full-text search queries do not support additional WHERE restrictions");
     }
 
-    // A score slot was allocated, so BM25() was selected and a provider will fill that slot per row
-    // by matching each row to the full-text index's response.
-    if (ordering_info->score_temporary_index) {
+    // A score or rank slot was allocated, so what the search said about each row is selected, and a
+    // provider will fill those slots by matching each row to the index's response by primary key.
+    if (ordering_info->score_temporary_index || ordering_info->rank_temporary_index) {
         external_search::fetch_primary_key_columns(*selection, *schema);
     }
 
@@ -334,14 +386,15 @@ future<shared_ptr<cql_transport::messages::result_message>> fulltext_indexed_tab
     auto read = co_await query_base_table(qp, state, options, timeout, pkeys.value());
 
     const auto score_slot = _bm25_ordering_info.score_temporary_index;
+    const auto rank_slot = _bm25_ordering_info.rank_temporary_index;
     const auto fragment_slot = _bm25_ordering_info.highlight_temporary_index;
 
     auto provider = std::unique_ptr<external_search_provider>{};
-    if (read.rows && (score_slot || fragment_slot)) {
+    if (read.rows && (score_slot || rank_slot || fragment_slot)) {
         // What the search says about a row can only be lined up with it now that the rows are read,
         // and a fragment does not exist at all until the index has been sent their text.
         auto answers = match_search_results(*read.rows.value(), read.command->slice, *_schema, *_selection, pkeys.value(), score_slot,
-                fragment_slot ? _bm25_ordering_info.highlighted_column : nullptr);
+                rank_slot, fragment_slot ? _bm25_ordering_info.highlighted_column : nullptr);
 
         if (fragment_slot) {
             auto fragments = co_await fetch_highlights(qp.vector_store_client(), _schema->ks_name(), _index.metadata().name(), search_term_text,

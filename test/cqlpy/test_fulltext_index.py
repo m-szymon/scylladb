@@ -800,17 +800,15 @@ def test_highlight_without_fulltext_index_rejected(cql, test_keyspace):
 
 
 def test_highlight_in_where_rejected(cql, fulltext_table):
-    """A fragment is text: there is nothing to restrict by, and it is not what selects the rows."""
-    with pytest.raises(InvalidRequest, match=re.escape("BM25_HIGHLIGHT() is only supported in the SELECT clause")):
-        cql.prepare(f"SELECT * FROM {fulltext_table} WHERE BM25_HIGHLIGHT(content, 'hello') > 'x' "
-                    f"ORDER BY BM25(content, 'hello') LIMIT 10")
+    """A fragment is text: there is nothing to restrict by, and it is not what selects the rows.
 
-
-def test_highlight_in_where_with_integer_rejected(cql, fulltext_table):
-    """Restricting a fragment by a number is refused by the type checker before the clause is even considered."""
-    with pytest.raises(InvalidRequest, match="Invalid INTEGER constant"):
-        cql.prepare(f"SELECT * FROM {fulltext_table} WHERE BM25_HIGHLIGHT(content, 'hello') > 0 "
-                    f"ORDER BY BM25(content, 'hello') LIMIT 10")
+    A relation names the reading it compares, and a fragment is not one - so this is refused where
+    every uncomparable function is, before the clause it appears in is looked at.
+    """
+    for rhs in ["'x'", "0"]:
+        with pytest.raises(InvalidRequest, match=re.escape("bm25_highlight() answers with nothing a relation can compare")):
+            cql.prepare(f"SELECT * FROM {fulltext_table} WHERE BM25_HIGHLIGHT(content, 'hello') > {rhs} "
+                        f"ORDER BY BM25(content, 'hello') LIMIT 10")
 
 
 def test_highlight_in_order_by_rejected(cql, fulltext_table):
@@ -824,6 +822,12 @@ def test_highlight_outside_select_statement_rejected(cql, fulltext_table):
     """A search's values describe a search, so they have no meaning in a mutation."""
     for statement in [f"UPDATE {fulltext_table} SET content = 'x' WHERE p = 1 AND BM25_HIGHLIGHT(content, 'hello') > 'x'",
                       f"DELETE FROM {fulltext_table} WHERE p = 1 AND BM25_HIGHLIGHT(content, 'hello') > 'x'"]:
+        # A fragment cannot be compared anywhere, which settles this before the statement kind is
+        # looked at; BM25() itself is what the SELECT-only rule still catches.
+        with pytest.raises(InvalidRequest, match="answers with nothing a relation can compare"):
+            cql.execute(statement)
+    for statement in [f"UPDATE {fulltext_table} SET content = 'x' WHERE p = 1 AND BM25(content, 'hello') > 0",
+                      f"DELETE FROM {fulltext_table} WHERE p = 1 AND BM25(content, 'hello') > 0"]:
         with pytest.raises(InvalidRequest, match="only supported in SELECT statements"):
             cql.execute(statement)
 

@@ -2197,7 +2197,9 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
     const auto& scoring_restrictions = restrictions->get_scoring_function_restrictions();
 
     bool has_bm25_restriction = std::ranges::any_of(scoring_restrictions, [](const expr::binary_operator& binop) {
-        return expr::is_native_function_call(binop.lhs, functions::BM25_FUNCTION_NAME);
+        // A relation compares a search's score, whichever of the family named the search: the call
+        // was rewritten to that reading when it was prepared.
+        return expr::is_native_function_call(binop.lhs, functions::BM25_SCORE_FUNCTION_NAME);
     });
     bool is_fts_query = has_bm25_restriction || has_bm25_ordering;
 
