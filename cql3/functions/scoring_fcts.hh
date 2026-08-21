@@ -38,6 +38,13 @@ static const function_name ANN_RANK_FUNCTION_NAME = function_name::native_functi
 /// Score first: it is the reading a bare comparison means.
 data_type search_hit_type();
 
+/// Fuses the answers of several searches into one score to rank rows by.
+static const function_name RRF_FUNCTION_NAME = function_name::native_function("rrf");
+
+/// Creates the reciprocal-rank fusion function for a call of `arity` searches.  Variadic, so like
+/// the ANN family it is built per call site rather than declared once.
+shared_ptr<function> make_rrf_function(size_t arity);
+
 /// Whether `name` is one of the ANN family, whose argument types are not fixed but inferred from
 /// the call site.
 bool is_ann_function_name(const function_name& name);

@@ -116,6 +116,42 @@ shared_ptr<function> make_bm25_highlight_function() {
             std::vector<data_type>{utf8_type, utf8_type}, nullptr);
 }
 
+/// How much a rank of 1 is worth relative to the ranks behind it.
+///
+/// Reciprocal-rank fusion scores a row at sum(1 / (k + rank)) over the searches that found it. The
+/// constant flattens the curve: without it the top rank would be worth so much more than the second
+/// that agreement between searches could never outweigh one search's first place. 60 is the value
+/// the original paper settled on and what every implementation uses, so a score computed here is
+/// comparable with one computed anywhere else.
+constexpr int32_t RRF_K = 60;
+
+shared_ptr<function> make_rrf_function(size_t arity) {
+    // rrf(hit, hit, ...) -> float
+    //
+    // Pure: it is an ordinary computation over what the searches answered, with nothing external
+    // about it. Its arguments are what make a call to it worth keeping until execution.
+    return make_native_scalar_function<true>(RRF_FUNCTION_NAME.name, float_type,
+            std::vector<data_type>(arity, search_hit_type()),
+            [] (std::span<const bytes_opt> args) -> bytes_opt {
+        float score = 0.0f;
+        for (const auto& arg : args) {
+            if (!arg) {
+                // No answer at all from that search: it did not find this row.
+                continue;
+            }
+            auto hit = value_cast<tuple_type_impl::native_type>(search_hit_type()->deserialize(bytes_view(*arg)));
+            // A pair whose rank is absent says the same thing. The score half is not read: ranks
+            // are what searches can be compared on, which is the whole point of fusing by them.
+            if (hit.size() < 2 || hit[1].is_null()) {
+                continue;
+            }
+            score += 1.0f / static_cast<float>(RRF_K + value_cast<int32_t>(hit[1]));
+        }
+        // A row no search found scores 0 and sorts last, which is where it belongs.
+        return float_type->decompose(score);
+    });
+}
+
 shared_ptr<function> make_ann_function(const function_name& name, const std::vector<data_type>& arg_types) {
     // Vector search: ann(column, query_vector) -> (score, rank), and its two halves.
     return ::make_shared<external_scalar_function>(name.name, ann_return_type(name), arg_types, ann_comparison_reading(name));
