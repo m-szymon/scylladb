@@ -45,10 +45,20 @@ std::vector<float> to_query_vector(const column_definition& ann_column, const cq
     return util::to_vector<float>(values);
 }
 
-/// The similarity a rescored ANN ordering's score is computed with.  It reads the fetched vector
-/// column and the query vector, so it needs nothing injected per row.
+
+/// Which of a vector search's readings a call names: the pair the search answers with, or one of
+/// its halves.
+enum class ann_reading { hit, score, rank };
+
+struct named_ann_reading {
+    ann_reading reading;
+    std::string_view name;
+};
+
+} // anonymous namespace
+
 expr::expression make_similarity_expression(const secondary_index::index& index,
-        const select_statement::prepared_ann_ordering_type& prepared_ann_ordering,
+        const raw::select_statement::prepared_ann_ordering_type& prepared_ann_ordering,
         data_dictionary::database db, const schema_ptr& schema) {
     auto similarity_function_name = secondary_index::vector_index::get_cql_similarity_function_name(index.metadata().options());
     auto func_name = functions::function_name::native_function(sstring(similarity_function_name));
@@ -67,196 +77,6 @@ expr::expression make_similarity_expression(const secondary_index::index& index,
         .func = func,
         .args = std::move(args),
     };
-}
-
-/// Which of a vector search's readings a call names: the pair the search answers with, or one of
-/// its halves.
-enum class ann_reading { hit, score, rank };
-
-struct named_ann_reading {
-    ann_reading reading;
-    std::string_view name;
-};
-
-std::optional<named_ann_reading> ann_reading_of(const expr::function_call& fc) {
-    // Both 'ANN(column, query_vector)' and the legacy 'column ANN OF query_vector' parse into an
-    // ann() call, so the pair is what the legacy syntax names too.
-    if (expr::is_native_function_call(fc, functions::ANN_FUNCTION_NAME)) {
-        return named_ann_reading{ann_reading::hit, "ANN"};
-    }
-    if (expr::is_native_function_call(fc, functions::ANN_SCORE_FUNCTION_NAME)) {
-        return named_ann_reading{ann_reading::score, "ANN_SCORE"};
-    }
-    if (expr::is_native_function_call(fc, functions::ANN_RANK_FUNCTION_NAME)) {
-        return named_ann_reading{ann_reading::rank, "ANN_RANK"};
-    }
-    return std::nullopt;
-}
-
-/// Orders by a score column of the result row, descending, rows without a usable score last.
-select_statement::ordering_comparator_type descending_score_comparator(size_t score_column_index) {
-    return [score_column_index, type = float_type] (const raw::select_statement::result_row_type& r1, const raw::select_statement::result_row_type& r2) {
-        auto& c1 = r1[score_column_index];
-        auto& c2 = r2[score_column_index];
-        auto f1 = c1 ? value_cast<float>(type->deserialize(*c1)) : std::numeric_limits<float>::quiet_NaN();
-        auto f2 = c2 ? value_cast<float>(type->deserialize(*c2)) : std::numeric_limits<float>::quiet_NaN();
-        if (std::isfinite(f1) && std::isfinite(f2)) {
-            return f1 > f2;
-        }
-        return std::isfinite(f1);
-    };
-}
-
-} // anonymous namespace
-
-std::optional<ann_ordering_info> get_ann_ordering_info(
-        data_dictionary::database db,
-        schema_ptr schema,
-        const expr::function_call& fc) {
-
-    // Both 'ORDER BY ANN(column, query_vector)' and the legacy
-    // 'ORDER BY column ANN OF query_vector' are parsed into an ann() call.
-    if (!expr::is_native_function_call(fc, functions::ANN_FUNCTION_NAME)) {
-        return std::nullopt;
-    }
-
-    // The call has been resolved, which for ann() infers the vector type and dimension of the query
-    // vector from the ordered column - so a query vector of the wrong dimension and an argument
-    // that is not a float vector have both been rejected already.
-    auto [def, query_vector] = external_search::extract_call_arguments(fc, "ANN");
-
-    raw::select_statement::prepared_ann_ordering_type prepared_ann_ordering = std::make_pair(def, std::move(query_vector));
-
-    auto cf = db.find_column_family(schema);
-    auto& sim = cf.get_index_manager();
-
-    auto indexes = sim.list_indexes();
-    auto it = std::ranges::find_if(indexes, [def] (const auto& ind) {
-        return secondary_index::vector_index::is_vector_index_on_column(ind.metadata(), def->name_as_text());
-    });
-
-    if (it == indexes.end()) {
-        throw exceptions::invalid_request_exception("ANN ordering by vector requires the column to be indexed using 'vector_index'");
-    }
-
-    return ann_ordering_info{
-        *it,
-        std::move(prepared_ann_ordering),
-        secondary_index::vector_index::is_rescoring_enabled(it->metadata().options())
-    };
-}
-
-void prepare_ann_selectors(std::vector<selection::prepared_selector>& prepared_selectors,
-        std::optional<ann_ordering_info>& ordering_info, expr::temporary_allocator& temporaries_allocator,
-        data_dictionary::database db, const schema_ptr& schema, prepare_context& ctx) {
-    for (auto& ps : prepared_selectors) {
-        // What the user wrote, before any of it is lowered.  A lowered call formats as neither the
-        // call nor anything a client would recognize - a tuple of slots, or the similarity function
-        // a rescored score is recomputed by - so an unaliased selector keeps this as its name.
-        const auto written = ps.expr;
-        bool needs_alias = false;
-
-        ps.expr = expr::search_and_replace(ps.expr, [&] (const expr::expression& candidate) -> std::optional<expr::expression> {
-            const auto* fc = expr::as_if<expr::function_call>(&candidate);
-            if (!fc) {
-                return std::nullopt;
-            }
-            const auto reading = ann_reading_of(*fc);
-            if (!reading) {
-                return std::nullopt;
-            }
-
-            if (!ordering_info) {
-                throw exceptions::invalid_request_exception(seastar::format(
-                        "{}() is not supported in the SELECT clause without a matching ANN ordering", reading->name));
-            }
-
-            const auto& [ordering_column, ordering_vector] = ordering_info->prepared_ann_ordering;
-
-            auto [col, sel_vector] = external_search::extract_call_arguments(*fc, reading->name);
-            if (col != ordering_column) {
-                throw exceptions::invalid_request_exception(seastar::format(
-                        "{}() in SELECT must reference the same column as the ANN ordering", reading->name));
-            }
-
-            if (auto deferred = external_search::check_query_value(sel_vector, ordering_vector,
-                        seastar::format("{}() in SELECT must use the same query vector as the ANN ordering", reading->name))) {
-                // Lifted out of the selector tree, so nothing else registers its bind marker.
-                expr::fill_prepare_context(*deferred, ctx);
-                ordering_info->deferred_select_vectors.push_back(std::move(*deferred));
-            }
-
-            // A slot standing for a whole call carries it, so that an unaliased selector is still
-            // named after what the user wrote; the two inside a pair carry nothing, because
-            // neither of them is the call - naming that one is done below, from the whole selector.
-            auto slot = [&] (std::optional<size_t>& index, data_type type, bool standalone) {
-                if (!index) {
-                    index = temporaries_allocator.allocate();
-                }
-                return expr::expression(expr::temporary{.index = *index, .type = std::move(type),
-                        .replaced_expr = standalone ? std::optional<expr::expression>(candidate) : std::nullopt});
-            };
-
-            auto score = [&] (bool standalone) -> expr::expression {
-                if (!ordering_info->is_rescoring_enabled) {
-                    return slot(ordering_info->score_temporary_index, float_type, standalone);
-                }
-                // TODO: every occurrence computes it again, the hidden ordering selector included.
-                needs_alias = true;
-                return make_similarity_expression(ordering_info->index, std::make_pair(col, sel_vector), db, schema);
-            };
-
-            auto rank = [&] (bool standalone) -> expr::expression {
-                if (!ordering_info->is_rescoring_enabled) {
-                    return slot(ordering_info->rank_temporary_index, int32_type, standalone);
-                }
-                // A rescoring index reorders the rows by a score it recomputes here, so the rank
-                // the Vector Store gave them is the rank of an order they are no longer in -
-                // reporting it would be a wrong answer rather than a partial one.  The right
-                // answer, the rank in the recomputed order, needs the recomputed scores of every
-                // row at once, which nothing on this path holds.  0 says so: it is outside the
-                // range a rank occupies, so it reads as "not reported" rather than as the null
-                // that means "this search did not find the row".
-                needs_alias = true;
-                return expr::constant(cql3::raw_value::make_value(int32_type->decompose(int32_t(0))), int32_type);
-            };
-
-            switch (reading->reading) {
-            case ann_reading::score:
-                return score(true);
-            case ann_reading::rank:
-                return rank(true);
-            case ann_reading::hit:
-                needs_alias = true;
-                return expr::expression(expr::tuple_constructor{
-                        .elements = {score(false), rank(false)},
-                        .type = functions::search_hit_type(),
-                });
-            }
-            on_internal_error(vs_log, "unhandled ANN reading");
-        });
-
-        if (needs_alias && !ps.alias) {
-            ps.alias = ::make_shared<column_identifier>(fmt::format("{:result_set_metadata}", written), true);
-        }
-    }
-}
-
-select_statement::ordering_comparator_type rescored_similarity_ordering(
-        std::vector<selection::prepared_selector>& prepared_selectors,
-        const ann_ordering_info& ann_ordering_info,
-        data_dictionary::database db,
-        schema_ptr schema) {
-    auto similarity = make_similarity_expression(ann_ordering_info.index, ann_ordering_info.prepared_ann_ordering, db, schema);
-    // The comparator reads the column as a float; every similarity function returns one, but
-    // nothing in the types says so.
-    throwing_assert(expr::type_of(similarity) == float_type);
-
-    prepared_selectors.push_back(selection::prepared_selector{
-        .expr = std::move(similarity),
-        .alias = nullptr,
-    });
-    return descending_score_comparator(prepared_selectors.size() - 1);
 }
 
 ::shared_ptr<cql3::statements::select_statement> vector_indexed_table_select_statement::prepare(data_dictionary::database db, schema_ptr schema,
