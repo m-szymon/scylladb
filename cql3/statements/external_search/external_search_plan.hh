@@ -62,8 +62,9 @@ struct call_reading {
 /// bind marker standing where at least one of the two values will be.
 struct deferred_query_value {
     expr::expression value;
-    /// The function it was written in, so that a rejection names what the user wrote.
-    std::string_view function_name;
+    /// What to say when it turns out to differ.  Settled here, where what the user wrote is still
+    /// in hand, rather than reconstructed at execution from a call that is no longer there.
+    sstring disagreement_message;
 };
 
 /// One search an external index will be asked to run, and the slots its answers reach a row in.
@@ -93,6 +94,10 @@ struct search_source {
     const column_definition* fragment_column = nullptr;
 
     std::vector<deferred_query_value> deferred;
+    /// Every source has one; a statement asking for nothing about a search only ranks by it.
+    std::vector<deferred_query_value>& deferrals() {
+        return deferred;
+    }
 
     bool reports_anything() const {
         return score_slot || rank_slot || fragment_slot;

@@ -9,9 +9,9 @@
 #include "cql3/statements/external_search/external_search_plan.hh"
 
 #include "cql3/statements/external_search/external_function.hh"
-#include "cql3/statements/external_search/fulltext_indexed_table_select_statement.hh"
-#include "cql3/statements/external_search/vector_indexed_table_select_statement.hh"
+#include "cql3/statements/external_search/external_search_select_statement.hh"
 #include "cql3/expr/expr-utils.hh"
+#include "cql3/functions/functions.hh"
 #include "cql3/functions/scoring_fcts.hh"
 #include "cql3/restrictions/statement_restrictions.hh"
 #include "exceptions/exceptions.hh"
@@ -83,6 +83,26 @@ sstring agreement_message(const call_reading& reading, std::string_view value_na
             : seastar::format("{}() in SELECT must use the same {} as BM25() in WHERE and ORDER BY", reading.name, value_name);
 }
 
+/// The similarity a rescored vector search's score is computed with on the coordinator.  It reads
+/// the fetched vector column and the query vector, so it needs nothing injected per row - which is
+/// also what lets it be evaluated in the position a nested occurrence asks for.
+expr::expression make_similarity_expression(const secondary_index::index& index, const column_definition* column,
+        const expr::expression& query_vector, data_dictionary::database db, const schema_ptr& schema) {
+    auto similarity = secondary_index::vector_index::get_cql_similarity_function_name(index.metadata().options());
+    auto name = functions::function_name::native_function(sstring(similarity));
+
+    std::vector<expr::expression> args{expr::column_value(column), query_vector};
+    std::vector<shared_ptr<assignment_testable>> provided_args{
+            expr::as_assignment_testable(args[0], expr::type_of(args[0])),
+            expr::as_assignment_testable(args[1], expr::type_of(args[1])),
+    };
+
+    return expr::function_call{
+            .func = functions::instance().get(db, schema->ks_name(), name, provided_args, schema->ks_name(), schema->cf_name(), nullptr),
+            .args = std::move(args),
+    };
+}
+
 /// The index that will answer a search of this kind on this column.
 secondary_index::index resolve_index(external_search_kind kind, data_dictionary::database db, const schema_ptr& schema,
         const column_definition& column) {
@@ -104,38 +124,6 @@ secondary_index::index resolve_index(external_search_kind kind, data_dictionary:
         throw exceptions::invalid_request_exception("No fulltext index found for full-text search query");
     }
     return *it;
-}
-
-/// The resolved state the statement classes still take.  They predate the plan and each describes
-/// one search of its own kind; a source says the same thing for either kind, so translating is a
-/// rename.  Both go away with the statement that runs several searches at once.
-ann_ordering_info to_ann_ordering_info(const search_source& source) {
-    return ann_ordering_info{
-            .index = source.index,
-            .prepared_ann_ordering = std::make_pair(source.column, source.query_value),
-            .is_rescoring_enabled = source.is_rescoring_enabled,
-            .score_temporary_index = source.score_slot,
-            .rank_temporary_index = source.rank_slot,
-            .deferred_select_vectors = source.deferred
-                    | std::views::transform([] (const deferred_query_value& deferred) { return deferred.value; })
-                    | std::ranges::to<std::vector>(),
-    };
-}
-
-bm25_ordering_info to_bm25_ordering_info(const search_source& source) {
-    return bm25_ordering_info{
-            .index = source.index,
-            .search_term = source.query_value,
-            .score_temporary_index = source.score_slot,
-            .rank_temporary_index = source.rank_slot,
-            .highlight_temporary_index = source.fragment_slot,
-            .highlighted_column = source.fragment_column,
-            .deferred_select_terms = source.deferred
-                    | std::views::transform([] (const deferred_query_value& deferred) {
-                          return deferred_select_term{deferred.value, deferred.function_name};
-                      })
-                    | std::ranges::to<std::vector>(),
-    };
 }
 
 } // anonymous namespace
@@ -184,12 +172,12 @@ search_source& external_search_plan::claim(const expr::function_call& fc, const 
     }
 
     // Two calls naming one search have to agree on what it asks, or they are not one search.
-    if (auto deferred = external_search::check_query_value(query_value, it->query_value,
-                agreement_message(reading, query_value_name(reading.kind)))) {
+    auto message = agreement_message(reading, query_value_name(reading.kind));
+    if (auto deferred = external_search::check_query_value(query_value, it->query_value, message)) {
         // Lifted out of the expression it was written in, whose lowered form is a leaf, so nothing
         // else will register its bind markers.
         expr::fill_prepare_context(*deferred, _ctx);
-        it->deferred.push_back({std::move(*deferred), reading.name});
+        it->deferred.push_back({std::move(*deferred), std::move(message)});
     }
     return *it;
 }
@@ -213,7 +201,7 @@ expr::expression external_search_plan::deliver(const call_reading& reading, cons
         // vector, so it needs no slot - and nothing else would do, since it is also what the rows
         // are reordered by.  It reads back as the similarity function, not as the call.
         unnamed = true;
-        return make_similarity_expression(source.index, std::make_pair(source.column, source.query_value), _db, _schema);
+        return make_similarity_expression(source.index, source.column, source.query_value, _db, _schema);
     };
 
     auto rank = [&] (std::optional<expr::expression> replaced) -> expr::expression {
@@ -278,8 +266,7 @@ void external_search_plan::bind_ordering(const expr::expression& prepared_orderi
             auto& source = claim(*fc, *reading, search_clause::ordering);
             if (source.is_rescoring_enabled) {
                 // Except here, where the index's order is not the requested one.
-                _ordering_expr = make_similarity_expression(
-                        source.index, std::make_pair(source.column, source.query_value), _db, _schema);
+                _ordering_expr = make_similarity_expression(source.index, source.column, source.query_value, _db, _schema);
             }
             return;
         }
@@ -337,24 +324,7 @@ void external_search_plan::bind_restrictions(const restrictions::statement_restr
 }
 
 ::shared_ptr<select_statement> external_search_plan::make_statement(external_statement_args args) const {
-    if (_sources.size() > 1) {
-        // Answering over several searches at once means asking each of them, merging the candidate
-        // keys of every answer, and injecting what each said into the same row.  Until that exists,
-        // one search per statement.
-        throw exceptions::invalid_request_exception("Combining several searches in one query is not supported yet");
-    }
-    const auto& source = _sources.front();
-
-    if (source.kind == external_search_kind::ann) {
-        return vector_indexed_table_select_statement::prepare(_db, args.schema, args.bound_terms, args.parameters,
-                std::move(args.selection), std::move(args.restrictions), std::move(args.group_by_cell_indices), args.is_reversed,
-                std::move(args.ordering_comparator), std::move(args.limit), std::move(args.per_partition_limit), args.stats,
-                to_ann_ordering_info(source), std::move(args.attrs));
-    }
-    return fulltext_indexed_table_select_statement::prepare(_db, args.schema, args.bound_terms, args.parameters,
-            std::move(args.selection), std::move(args.restrictions), std::move(args.group_by_cell_indices), args.is_reversed,
-            std::move(args.ordering_comparator), std::move(args.limit), std::move(args.per_partition_limit), args.stats,
-            to_bm25_ordering_info(source), std::move(args.attrs));
+    return external_search_select_statement::prepare(_db, _sources, std::move(args));
 }
 
 select_statement::ordering_comparator_type descending_score_ordering_comparator(
