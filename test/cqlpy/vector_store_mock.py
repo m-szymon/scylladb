@@ -4,8 +4,9 @@
 
 """Shared vector store mock for CQL Python tests.
 
-Provides VectorStoreMock - a minimal HTTP server for handling both ANN
-(`/ann`) and BM25 (`/bm25`) POST requests from a local Scylla process.
+Provides VectorStoreMock - a minimal HTTP server for handling the ANN
+(`/ann`), BM25 (`/bm25`) and substring (`/contains`) POST requests from a
+local Scylla process.
 """
 
 from collections.abc import Callable
@@ -32,14 +33,22 @@ class BM25Response:
     body: str = '{"primary_keys":{},"scores":[]}'
 
 
+@dataclass
+class ContainsResponse:
+    status: int = 200
+    body: str = '{"primary_keys":{}}'
+
+
 class VectorStoreMock:
     def __init__(self):
         self._ann_requests: list[Request] = []
         self._bm25_requests: list[Request] = []
+        self._contains_requests: list[Request] = []
         self._status_requests: list[Request] = []
         self._lock = threading.Lock()
         self._next_ann_response = Response()
         self._next_bm25_response = BM25Response()
+        self._next_contains_response = ContainsResponse()
         self._next_status_response = Response(status=200, body='"SERVING"')
         self._server: HTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -59,6 +68,11 @@ class VectorStoreMock:
             return self._bm25_requests.copy()
 
     @property
+    def contains_requests(self) -> list[Request]:
+        with self._lock:
+            return self._contains_requests.copy()
+
+    @property
     def status_requests(self) -> list[Request]:
         with self._lock:
             return self._status_requests.copy()
@@ -71,6 +85,10 @@ class VectorStoreMock:
         with self._lock:
             self._next_bm25_response = BM25Response(status=status, body=body)
 
+    def set_next_contains_response(self, status: int, body: str) -> None:
+        with self._lock:
+            self._next_contains_response = ContainsResponse(status=status, body=body)
+
     def set_next_status_response(self, status: int, body: str) -> None:
         with self._lock:
             self._next_status_response = Response(status=status, body=body)
@@ -79,9 +97,11 @@ class VectorStoreMock:
         with self._lock:
             self._ann_requests.clear()
             self._bm25_requests.clear()
+            self._contains_requests.clear()
             self._status_requests.clear()
             self._next_ann_response = Response()
             self._next_bm25_response = BM25Response()
+            self._next_contains_response = ContainsResponse()
             self._next_status_response = Response(status=200, body='"SERVING"')
 
     def _handle_ann(self, request: Request, send_response: Callable[[Response], None]) -> None:
@@ -94,6 +114,12 @@ class VectorStoreMock:
         with self._lock:
             self._bm25_requests.append(request)
             response = self._next_bm25_response
+        send_response(response)
+
+    def _handle_contains(self, request: Request, send_response: Callable[[ContainsResponse], None]) -> None:
+        with self._lock:
+            self._contains_requests.append(request)
+            response = self._next_contains_response
         send_response(response)
 
     def _handle_status(self, request: Request, send_response: Callable[[Response], None]) -> None:
@@ -117,6 +143,8 @@ class VectorStoreMock:
                     mock._handle_ann(req, self._send_response)
                 elif self.path.endswith("/bm25"):
                     mock._handle_bm25(req, self._send_response)
+                elif self.path.endswith("/contains"):
+                    mock._handle_contains(req, self._send_response)
                 else:
                     self.send_response(404)
                     self.end_headers()

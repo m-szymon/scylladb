@@ -78,6 +78,8 @@ public:
     using ann_error_visitor = error_visitor;
     using fts_error = ann_error;
     using fts_error_visitor = ann_error_visitor;
+    using contains_error = ann_error;
+    using contains_error_visitor = ann_error_visitor;
 
     explicit vector_store_client(config const& cfg);
     ~vector_store_client();
@@ -121,6 +123,12 @@ public:
     /// more relevant).
     auto bm25(keyspace_name keyspace, index_name name, schema_ptr schema, query_string fts_query, limit limit, abort_source& as)
             -> future<std::expected<primary_keys, fts_error>>;
+
+    /// Request the vector store service for the primary keys of the rows whose indexed value
+    /// contains `keyword` (the `LIKE '%keyword%'` predicate), in the index's own order. Nothing
+    /// ranks them, so the similarity field of every returned primary_key is left at zero.
+    auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit, abort_source& as)
+            -> future<std::expected<primary_keys, contains_error>>;
 
     /// Request a fragment of each of the given documents, with the terms of `fts_query` marked.
     ///

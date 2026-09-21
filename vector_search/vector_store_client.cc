@@ -230,6 +230,55 @@ auto read_bm25_json(rjson::value const& json, schema_ptr const& schema) -> std::
     return read_scored_primary_keys_json(json, schema, "scores");
 }
 
+auto write_contains_json(query_string keyword, limit limit) -> json_content {
+    return seastar::format(R"({{"query":{},"limit":{}}})", rjson::from_string(keyword), limit);
+}
+
+/// Reads a reply carrying primary keys and nothing to rank them by, so the number of results is
+/// the length of the key arrays, taken from the first partition-key column's.
+auto read_primary_keys_json(rjson::value const& json, schema_ptr const& schema) -> std::expected<primary_keys, ann_error> {
+    if (!json.IsObject()) {
+        vslogger.error("Vector Store returned invalid JSON: the reply is not an object");
+        return std::unexpected{service_reply_format_error{}};
+    }
+    if (!json.HasMember("primary_keys")) {
+        vslogger.error("Vector Store returned invalid JSON: missing 'primary_keys'");
+        return std::unexpected{service_reply_format_error{}};
+    }
+    auto const& keys_json = json["primary_keys"];
+    if (!keys_json.IsObject()) {
+        vslogger.error("Vector Store returned invalid JSON: 'primary_keys' is not an object");
+        return std::unexpected{service_reply_format_error{}};
+    }
+
+    auto const& first_key_column = *schema->partition_key_columns().begin();
+    auto const* first_key_json = rjson::find(keys_json, first_key_column.name_as_text());
+    if (first_key_json == nullptr) {
+        vslogger.error("Vector Store returned invalid JSON: missing key column '{}'", first_key_column.name_as_text());
+        return std::unexpected{service_reply_format_error{}};
+    }
+    if (!first_key_json->IsArray()) {
+        vslogger.error("Vector Store returned invalid JSON: key column '{}' is not an array", first_key_column.name_as_text());
+        return std::unexpected{service_reply_format_error{}};
+    }
+    auto size = first_key_json->GetArray().Size();
+
+    auto keys = primary_keys{};
+    keys.reserve(size);
+    for (auto idx = 0U; idx < size; ++idx) {
+        auto pk = pk_from_json(keys_json, idx, schema);
+        if (!pk) {
+            return std::unexpected{pk.error()};
+        }
+        auto ck = ck_from_json(keys_json, idx, schema);
+        if (!ck) {
+            return std::unexpected{ck.error()};
+        }
+        keys.push_back(primary_key{dht::decorate_key(*schema, *pk), *ck});
+    }
+    return std::move(keys);
+}
+
 auto write_highlight_json(query_string query, documents docs) -> json_content {
     auto quoted_docs = docs | std::views::transform([](auto const& doc) {
         return rjson::quote_json_string(doc);
@@ -478,6 +527,22 @@ struct vector_store_client::impl {
         }
     }
 
+    auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit, abort_source& as)
+            -> future<std::expected<primary_keys, contains_error>> {
+        auto content = co_await post_to_index("contains", format("/api/v1/indexes/{}/{}/contains", keyspace, name),
+                write_contains_json(std::move(keyword), limit), as);
+        if (!content) {
+            co_return std::unexpected{content.error()};
+        }
+
+        try {
+            co_return read_primary_keys_json(rjson::parse(std::move(*content)), schema);
+        } catch (const rjson::error& e) {
+            vslogger.error("Vector Store returned invalid JSON: {}", e.what());
+            co_return std::unexpected{service_reply_format_error{}};
+        }
+    }
+
     auto highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents docs, abort_source& as)
             -> future<std::expected<highlights, fts_error>> {
         auto documents_sent = docs.size();
@@ -553,6 +618,11 @@ auto vector_store_client::ann(keyspace_name keyspace, index_name name, schema_pt
 auto vector_store_client::bm25(keyspace_name keyspace, index_name name, schema_ptr schema, query_string fts_query, limit limit, abort_source& as)
         -> future<std::expected<primary_keys, fts_error>> {
     return _impl->bm25(std::move(keyspace), std::move(name), schema, std::move(fts_query), limit, as);
+}
+
+auto vector_store_client::contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit, abort_source& as)
+        -> future<std::expected<primary_keys, contains_error>> {
+    return _impl->contains(std::move(keyspace), std::move(name), schema, std::move(keyword), limit, as);
 }
 
 auto vector_store_client::highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents documents, abort_source& as)
