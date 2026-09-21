@@ -13,6 +13,7 @@
 #include "cql3/statements/select_statement.hh"
 #include "cql3/statements/external_search/vector_indexed_table_select_statement.hh"
 #include "cql3/statements/external_search/fulltext_indexed_table_select_statement.hh"
+#include "cql3/statements/external_search/substring_indexed_table_select_statement.hh"
 #include "cql3/statements/index_latency.hh"
 #include "cql3/expr/expression.hh"
 #include "cql3/expr/evaluate.hh"
@@ -27,6 +28,7 @@
 #include <seastar/coroutine/exception.hh>
 #include "index/vector_index.hh"
 #include "index/fulltext_index.hh"
+#include "index/substring_index.hh"
 #include "locator/tablets.hh"
 #include "service/qos/qos_common.hh"
 #include "transport/cql_protocol_extension.hh"
@@ -274,7 +276,8 @@ future<> select_statement::check_access(query_processor& qp, const service::clie
         if (secondary_index::vector_index::has_index(*base_schema)) {
             additional_permissions.set<auth::permission::VECTOR_SEARCH_INDEXING>();
         }
-        if (secondary_index::fulltext_index::has_index(*base_schema)) {
+        // A substring index is a text search too, so it is covered by the same permission.
+        if (secondary_index::fulltext_index::has_index(*base_schema) || secondary_index::substring_index::has_index(*base_schema)) {
             additional_permissions.set<auth::permission::TEXT_SEARCH_INDEXING>();
         }
         co_await state.has_column_family_access(keyspace(), cf_name, auth::permission::SELECT, auth::command_desc::type::OTHER, additional_permissions);
@@ -2230,6 +2233,19 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
         throw exceptions::invalid_request_exception("BM25 and ANN cannot be combined in the same query");
     }
 
+    // A LIKE the restriction analysis handed to a substring index is a substring search query,
+    // answered by the index node like the BM25 and ANN ones rather than by the index's view.
+    bool is_substring_query = false;
+    if (restrictions->uses_secondary_indexing()) {
+        auto& sim = db.find_column_family(schema).get_index_manager();
+        if (auto idx = restrictions->find_idx(sim); idx && secondary_index::substring_index::is_substring_index(idx->metadata())) {
+            is_substring_query = true;
+        }
+    }
+    if (is_substring_query && (is_ann_query || is_fts_query)) {
+        throw exceptions::invalid_request_exception("A LIKE on a substring-indexed column cannot be combined with BM25 or ANN in the same query");
+    }
+
     // Scoring restrictions are held out of the filtering machinery, to be interpreted by the
     // external index that owns the scoring function.  If no such query type was selected,
     // nothing will interpret them and they would be silently dropped rather than applied.
@@ -2261,7 +2277,7 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
     }
 
     std::vector<sstring> warnings;
-    if (!is_ann_query && !is_fts_query) {
+    if (!is_ann_query && !is_fts_query && !is_substring_query) {
         check_needs_filtering(*restrictions, cfg.strict_allow_filtering(), warnings);
         ensure_filtering_columns_retrieval(db, *selection, *restrictions);
     }
@@ -2387,6 +2403,26 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
             prepare_limit(db, ctx, _per_partition_limit),
             stats,
             std::move(bm25_ordering_info_opt),
+            std::move(prepared_attrs));
+    } else if (is_substring_query) {
+        // Taken before the call: `restrictions` is moved into it, and the order in which the
+        // arguments are evaluated is unspecified.
+        auto& sim = db.find_column_family(schema).get_index_manager();
+        auto index = *restrictions->find_idx(sim);
+        stmt = substring_indexed_table_select_statement::prepare(
+            db,
+            schema,
+            ctx.bound_variables_size(),
+            _parameters,
+            std::move(selection),
+            std::move(restrictions),
+            std::move(group_by_cell_indices),
+            is_reversed_,
+            std::move(ordering_comparator),
+            prepare_limit(db, ctx, _limit),
+            prepare_limit(db, ctx, _per_partition_limit),
+            stats,
+            index,
             std::move(prepared_attrs));
     } else if (restrictions->uses_secondary_indexing()) {
         stmt = view_indexed_table_select_statement::prepare(

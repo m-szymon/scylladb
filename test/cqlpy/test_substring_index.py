@@ -214,3 +214,90 @@ def test_drop_substring_index(cql, test_keyspace):
         cql.execute(f"CREATE CUSTOM INDEX {index_name} ON {table}(nickname) USING 'substring_index'")
         cql.execute(f"DROP INDEX {test_keyspace}.{index_name}")
         cql.execute(f"ALTER TABLE {table} WITH cdc = {{'enabled': false}}")
+
+
+###############################################################################
+# Prepare-time validation of LIKE queries on a substring-indexed column. Nothing
+# below reaches the Vector Store: the queries are prepared, not executed, or are
+# rejected before the index node is asked.
+###############################################################################
+
+
+@pytest.fixture(scope="module")
+def substring_table(cql, test_keyspace):
+    table = test_keyspace + "." + unique_name()
+    cql.execute(f"CREATE TABLE {table} (p int primary key, nickname text, other text)")
+    cql.execute(f"INSERT INTO {table} (p, nickname, other) VALUES (1, 'hello world', 'x')")
+    cql.execute(f"CREATE CUSTOM INDEX ON {table}(nickname) USING 'substring_index' WITH OPTIONS = {{'min_gram': '2'}}")
+    yield table
+    cql.execute(f"DROP TABLE {table}")
+
+
+def test_like_contains_prepares_without_allow_filtering(cql, substring_table):
+    """A '%keyword%' LIKE on the indexed column is served by the index, so no ALLOW FILTERING is needed."""
+    cql.prepare(f"SELECT * FROM {substring_table} WHERE nickname LIKE '%ell%' LIMIT 10")
+    cql.prepare(f"SELECT * FROM {substring_table} WHERE nickname LIKE ? LIMIT 10")
+
+
+def test_like_contains_requires_limit(cql, substring_table):
+    """A routed LIKE without LIMIT must be rejected."""
+    with pytest.raises(InvalidRequest, match="require a LIMIT"):
+        cql.execute(f"SELECT * FROM {substring_table} WHERE nickname LIKE '%ell%'")
+
+
+@pytest.mark.parametrize("pattern", ["ell%", "%ell", "%e_l%", "%e%l%", "%e\\\\%l%", "%e%", "ell", "%%"])
+def test_like_unsupported_pattern_keeps_filtering_semantics(cql, substring_table, pattern):
+    """A literal pattern the index does not serve behaves exactly as without the index: ALLOW FILTERING is required, and works."""
+    with pytest.raises(InvalidRequest, match="ALLOW FILTERING"):
+        cql.execute(f"SELECT * FROM {substring_table} WHERE nickname LIKE '{pattern}' LIMIT 10")
+    list(cql.execute(f"SELECT * FROM {substring_table} WHERE nickname LIKE '{pattern}' LIMIT 10 ALLOW FILTERING"))
+
+
+def test_like_on_column_without_substring_index_keeps_filtering_semantics(cql, substring_table):
+    """A '%keyword%' LIKE on another column is not routed."""
+    with pytest.raises(InvalidRequest, match="ALLOW FILTERING"):
+        cql.execute(f"SELECT * FROM {substring_table} WHERE other LIKE '%x%' LIMIT 10")
+    list(cql.execute(f"SELECT * FROM {substring_table} WHERE other LIKE '%x%' LIMIT 10 ALLOW FILTERING"))
+
+
+def test_like_on_fulltext_indexed_column_is_not_routed(cql, test_keyspace):
+    """A fulltext index does not answer LIKE."""
+    schema = 'p int primary key, content text'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(content) USING 'fulltext_index'")
+        with pytest.raises(InvalidRequest, match="ALLOW FILTERING"):
+            cql.execute(f"SELECT * FROM {table} WHERE content LIKE '%hello%' LIMIT 10")
+
+
+@pytest.mark.parametrize("where", [
+    "p = 1 AND nickname LIKE '%ell%'",
+    "nickname LIKE '%ell%' AND other = 'x'",
+    "nickname LIKE '%ell%' AND nickname LIKE '%wor%'",
+])
+def test_like_contains_rejects_additional_restrictions(cql, substring_table, where):
+    """The index answers exactly one containment; anything else in WHERE is rejected."""
+    with pytest.raises(InvalidRequest):
+        cql.execute(f"SELECT * FROM {substring_table} WHERE {where} LIMIT 10")
+
+
+def test_like_contains_rejects_bm25_combination(cql, test_keyspace):
+    """Substring and full-text searches cannot be combined."""
+    schema = 'p int primary key, nickname text, content text'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(nickname) USING 'substring_index'")
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(content) USING 'fulltext_index'")
+        with pytest.raises(InvalidRequest, match="cannot be combined"):
+            cql.execute(f"SELECT * FROM {table} WHERE nickname LIKE '%ell%' AND BM25(content, 'hello') > 0 "
+                        f"ORDER BY BM25(content, 'hello') LIMIT 10")
+
+
+@pytest.mark.parametrize("clause", ["ORDER BY p", "PER PARTITION LIMIT 1", "GROUP BY p"])
+def test_like_contains_rejects_ordering_grouping_and_per_partition_limit(cql, substring_table, clause):
+    """Stage one returns the rows in no particular order and cannot group them."""
+    with pytest.raises(InvalidRequest):
+        cql.execute(f"SELECT * FROM {substring_table} WHERE nickname LIKE '%ell%' {clause} LIMIT 10")
+
+
+def test_like_contains_rejects_aggregation(cql, substring_table):
+    with pytest.raises(InvalidRequest, match="aggregation"):
+        cql.execute(f"SELECT COUNT(*) FROM {substring_table} WHERE nickname LIKE '%ell%' LIMIT 10")

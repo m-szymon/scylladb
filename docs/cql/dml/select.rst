@@ -517,6 +517,50 @@ the built-in operator as ``system.bm25(...)`` to disambiguate it.
 For the full list of query constraints and requirements, see
 :doc:`Full-Text Search </features/fulltext-search>`.
 
+.. _substring-queries:
+
+Substring search queries (LIKE) :label-note:`ScyllaDB Cloud`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. note::
+
+   Substring Search is supported in ScyllaDB Cloud only in clusters that have the Vector and Text Search feature enabled.
+   For more information, see the :doc:`Substring Search documentation </features/substring-search>`.
+
+On a column that has a :ref:`substring index <create-substring-index-statement>`, a ``LIKE`` filter of the
+form ``'%keyword%'`` is answered by the index instead of by a filtered scan, so it needs no
+``ALLOW FILTERING``:
+
+.. code-block::
+
+   substring_query: SELECT ... FROM `table_name`
+                  :   WHERE `column_name` LIKE '%' `keyword` '%'
+                  :   LIMIT `integer`
+
+Example::
+
+    SELECT user_id, nickname FROM users
+        WHERE nickname LIKE '%将军%'
+        LIMIT 20;
+
+The rules are:
+
+* The pattern must start and end with ``%``, and the keyword between them must contain neither the
+  wildcards ``%`` and ``_`` nor the escape ``\``. Any other pattern, such as a prefix ``'kw%'``, is not
+  served by the index and behaves exactly as on a column without one: it requires ``ALLOW FILTERING``
+  and scans the table.
+* The keyword must be at least ``min_gram`` characters long, counted in characters, not bytes.
+* A bind marker may stand for the pattern (``LIKE ?``). The index is chosen when the statement is
+  prepared, so the bound pattern is checked when the statement is executed, and a pattern the index
+  does not serve is then rejected rather than scanned.
+* ``LIMIT`` is mandatory and must not exceed 1000. ``ORDER BY``, ``PER PARTITION LIMIT``, ``GROUP BY``,
+  aggregation and any further ``WHERE`` restriction are not supported.
+* The matching rows are returned in no particular order, like any other ``LIKE`` filter, and without
+  paging; when the requested page size is smaller than ``LIMIT`` the whole result is returned with a
+  warning.
+* Matching is case-sensitive, like ``LIKE``, unless the index was created with
+  ``'case_sensitive': 'false'``.
+
 .. _limit-clause:
 
 Limiting results

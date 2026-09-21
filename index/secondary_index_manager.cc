@@ -23,6 +23,8 @@
 #include "index/substring_index.hh"
 #include "index/vector_index.hh"
 
+#include "cql3/statements/external_search/substring_pattern.hh"
+
 #include "cql3/expr/expression.hh"
 #include "cql3/util.hh"
 #include "index/target_parser.hh"
@@ -81,6 +83,22 @@ index::supports_expression_v index::supports_bm25_expression(const column_defini
     }
     auto custom_class = secondary_index_manager::get_custom_class(_im);
     return supports_expression_v::from_bool(custom_class && dynamic_cast<fulltext_index*>(custom_class->get()) != nullptr);
+}
+
+index::supports_expression_v index::supports_like_expression(const column_definition& cdef, const cql3::expr::expression& rhs) const {
+    if (cdef.name_as_text() != _target_column || !substring_index::is_substring_index(_im)) {
+        return supports_expression_v::from_bool(false);
+    }
+    if (const auto* pattern = cql3::expr::as_if<cql3::expr::constant>(&rhs)) {
+        if (pattern->is_null()) {
+            return supports_expression_v::from_bool(false);
+        }
+        const auto keyword = cql3::statements::external_search::parse_contains_pattern(
+                pattern->view().deserialize<sstring>(*pattern->type), substring_index::min_gram(_im));
+        return supports_expression_v::from_bool(keyword.has_value());
+    }
+    // A pattern known only at execution: routed, and rejected then if it turns out not to be one the index serves.
+    return supports_expression_v::from_bool(true);
 }
 
 index::supports_expression_v index::supports_subscript_expression(const column_definition& cdef, const cql3::expr::oper_t op) const {

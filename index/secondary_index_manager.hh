@@ -25,6 +25,7 @@
 namespace cql3::expr {
 
 enum class oper_t;
+class expression;
 
 }
 
@@ -88,6 +89,10 @@ public:
 
     supports_expression_v supports_expression(const column_definition& cdef, const cql3::expr::oper_t op) const;
     supports_expression_v supports_bm25_expression(const column_definition& cdef) const;
+    /// Whether `cdef LIKE rhs` can be answered by this index: only a substring index on `cdef`, and
+    /// only for a pattern it serves. A literal pattern is checked here; a pattern only execution
+    /// will know (a bind marker) is accepted and checked then.
+    supports_expression_v supports_like_expression(const column_definition& cdef, const cql3::expr::expression& rhs) const;
     supports_expression_v supports_subscript_expression(const column_definition& cdef, const cql3::expr::oper_t op) const;
     const index_metadata& metadata() const;
     const sstring& target_column() const {

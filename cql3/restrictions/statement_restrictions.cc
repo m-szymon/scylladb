@@ -693,6 +693,13 @@ is_predicate_supported_by(const predicate& pred, const secondary_index::index& i
             if (pred.is_subscript) {
                 return idx.supports_subscript_expression(*oc.column, *pred.op);
             }
+            if (*pred.op == oper_t::LIKE) {
+                // Whether an index serves a LIKE depends on the pattern, not only on the operator.
+                if (const auto* binop = expr::as_if<expr::binary_operator>(&pred.filter)) {
+                    return idx.supports_like_expression(*oc.column, binop->rhs);
+                }
+                return ret_t::from_bool(false);
+            }
             return idx.supports_expression(*oc.column, *pred.op);
         },
         [&] (const on_clustering_key_prefix& ocp) -> ret_t {

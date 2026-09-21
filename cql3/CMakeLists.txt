@@ -84,6 +84,7 @@ target_sources(cql3
     statements/select_statement.cc
     statements/external_search/external_index_select_statement.cc
     statements/external_search/fulltext_indexed_table_select_statement.cc
+    statements/external_search/substring_indexed_table_select_statement.cc
     statements/external_search/substring_pattern.cc
     statements/external_search/vector_indexed_table_select_statement.cc
     statements/external_search/external_score_provider.cc
