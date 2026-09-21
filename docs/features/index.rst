@@ -20,6 +20,7 @@ This document highlights ScyllaDB's key data modeling features.
    Automatic Repair </features/automatic-repair/>
    Vector Search </features/vector-search/>
    Full-Text Search </features/fulltext-search/>
+   Substring Search </features/substring-search/>
 
 .. panel-box::
   :title: ScyllaDB Features
@@ -52,3 +53,5 @@ This document highlights ScyllaDB's key data modeling features.
     similarity-based queries on vector embeddings.
   * :doc:`Full-Text Search </features/fulltext-search/>` lets you search and
     rank text columns by relevance using the BM25 scoring algorithm.
+  * :doc:`Substring Search </features/substring-search/>` answers
+    ``LIKE '%keyword%'`` on short text columns from an index instead of a scan.
