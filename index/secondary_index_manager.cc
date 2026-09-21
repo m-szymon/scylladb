@@ -20,6 +20,7 @@
 #include "index/secondary_index_manager.hh"
 #include "index/secondary_index.hh"
 #include "index/fulltext_index.hh"
+#include "index/substring_index.hh"
 #include "index/vector_index.hh"
 
 #include "cql3/expr/expression.hh"
@@ -224,6 +225,7 @@ std::optional<std::function<std::unique_ptr<custom_index>()>> secondary_index_ma
 
     const static std::unordered_map<std::string_view, std::function<std::unique_ptr<custom_index>()>> classes = {
         {"fulltext_index", fulltext_index_factory},
+        {"substring_index", substring_index_factory},
         {"vector_index", vector_index_factory},
     };
 

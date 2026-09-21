@@ -398,6 +398,57 @@ The analyzers differ in how they tokenize and normalize text:
   ``Hello,`` and ``World!``). It does not apply lowercasing, stemming,
   or stop-word removal.
 
+.. _create-substring-index-statement:
+
+Substring Index :label-note:`ScyllaDB Cloud`
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. note::
+
+   Substring indexes are supported in ScyllaDB Cloud only in clusters that have the Vector and Text Search feature enabled.
+   For the full description, see the :doc:`Substring Search documentation </features/substring-search>`.
+
+A substring index answers ``LIKE '%keyword%'`` filters on a text column without ``ALLOW FILTERING``.
+Instead of tokenizing the text into words, as a :ref:`full-text index <create-fulltext-index-statement>`
+does, it indexes every substring of the value between ``min_gram`` and ``max_gram`` characters long, so
+containment of a keyword is an exact lookup rather than a scan of the table. It is meant for short
+values such as names, identifiers and codes, in any script.
+
+A substring index is a custom index created using the ``CUSTOM`` keyword and the index type
+``substring_index``. CDC is enabled automatically on the base table when a substring index is created.
+
+**Column restrictions:**
+
+* The indexed column must be of type ``text``, ``varchar``, or ``ascii``. Other types are rejected.
+* The indexed column must be a regular column. Primary-key and static columns cannot be indexed.
+* The table must use tablets (not vnodes).
+
+Example::
+
+   CREATE CUSTOM INDEX ON users (nickname) USING 'substring_index';
+
+   CREATE CUSTOM INDEX ON users (username) USING 'substring_index'
+       WITH OPTIONS = {'case_sensitive': 'false'};
+
+The following options are supported for substring indexes:
+
++--------------------+---------------------------------------------------------------------------------------+-------------------+
+| Option             | Description                                                                           | Default Value     |
++====================+=======================================================================================+===================+
+| ``min_gram``       | Length, in characters, of the shortest indexed substring. A keyword shorter than this | ``1``             |
+|                    | cannot be answered by the index, so such a ``LIKE`` keeps needing ``ALLOW FILTERING``.|                   |
+|                    | Between ``1`` and ``8``.                                                              |                   |
++--------------------+---------------------------------------------------------------------------------------+-------------------+
+| ``max_gram``       | Length, in characters, of the longest indexed substring. A keyword up to this length  | ``3``             |
+|                    | is a single exact lookup; a longer one is answered from its substrings and verified.  |                   |
+|                    | Between ``1`` and ``8``, and not smaller than ``min_gram``. A larger value makes      |                   |
+|                    | longer keywords cheaper and the index larger.                                         |                   |
++--------------------+---------------------------------------------------------------------------------------+-------------------+
+| ``case_sensitive`` | Whether matching distinguishes letter case, as ``LIKE`` does. With ``false`` both the | ``true``          |
+|                    | indexed values and the keywords are lowercased, so ``'%ng%'`` matches ``NGgamer``.    |                   |
+|                    | Supported values: ``true``, ``false`` (case-insensitive).                             |                   |
++--------------------+---------------------------------------------------------------------------------------+-------------------+
+
 .. _drop-index-statement:
 
 DROP INDEX
