@@ -23,6 +23,7 @@
 #include "cql3/expr/expression.hh"
 #include "cql3/functions/native_scalar_function.hh"
 #include "cql3/statements/external_search/external_function.hh"
+#include "cql3/statements/external_search/substring_pattern.hh"
 #include "test/lib/expr_test_utils.hh"
 #include "types/types.hh"
 #include "types/vector.hh"
@@ -34,6 +35,7 @@ using namespace cql3::expr;
 using namespace cql3::expr::test_utils;
 
 using cql3::statements::external_search::equality;
+using cql3::statements::external_search::parse_contains_pattern;
 using cql3::statements::external_search::unevaluated_equality;
 
 BOOST_AUTO_TEST_SUITE(external_search_test)
@@ -113,6 +115,38 @@ BOOST_AUTO_TEST_CASE(unevaluated_equality_leaves_the_rest_to_execution) {
         return expression(cast{.style = cast::cast_style::c, .arg = marker(0, utf8_type), .type = utf8_type});
     };
     BOOST_REQUIRE(unevaluated_equality(to_text(), to_text()) == equality::unknown);
+}
+
+BOOST_AUTO_TEST_CASE(parse_contains_pattern_accepts_only_infix_keywords) {
+    BOOST_REQUIRE_EQUAL(parse_contains_pattern("%abc%", 1).value(), "abc");
+    BOOST_REQUIRE_EQUAL(parse_contains_pattern("%a b%", 1).value(), "a b");
+    BOOST_REQUIRE_EQUAL(parse_contains_pattern("%a%", 1).value(), "a");
+
+    // No keyword at all.
+    BOOST_REQUIRE(!parse_contains_pattern("", 1));
+    BOOST_REQUIRE(!parse_contains_pattern("%", 1));
+    BOOST_REQUIRE(!parse_contains_pattern("%%", 1));
+    // A prefix, a suffix or an equality are not containment.
+    BOOST_REQUIRE(!parse_contains_pattern("abc%", 1));
+    BOOST_REQUIRE(!parse_contains_pattern("%abc", 1));
+    BOOST_REQUIRE(!parse_contains_pattern("abc", 1));
+    // Wildcards and the escape inside the keyword make it non-literal.
+    BOOST_REQUIRE(!parse_contains_pattern("%a_c%", 1));
+    BOOST_REQUIRE(!parse_contains_pattern("%a%c%", 1));
+    BOOST_REQUIRE(!parse_contains_pattern("%a\\%c%", 1));
+    BOOST_REQUIRE(!parse_contains_pattern("%a\\c%", 1));
+}
+
+BOOST_AUTO_TEST_CASE(parse_contains_pattern_counts_characters_against_min_gram) {
+    BOOST_REQUIRE(parse_contains_pattern("%ab%", 2));
+    BOOST_REQUIRE(!parse_contains_pattern("%ab%", 3));
+    // Three characters in nine bytes.
+    BOOST_REQUIRE_EQUAL(parse_contains_pattern("%\u5b87\u5c06\u519b%", 3).value(), "\u5b87\u5c06\u519b");
+    BOOST_REQUIRE(!parse_contains_pattern("%\u5b87\u5c06%", 3));
+    // A four-byte code point is one character.
+    BOOST_REQUIRE(parse_contains_pattern("%\U0001F600%", 1));
+    BOOST_REQUIRE(!parse_contains_pattern("%\U0001F600%", 2));
+    BOOST_REQUIRE(parse_contains_pattern("%\U0001F600\U0001F601%", 2));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
