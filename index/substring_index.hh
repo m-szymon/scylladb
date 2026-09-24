@@ -14,6 +14,7 @@
 #include "cql3/statements/index_target.hh"
 #include "index/external_index.hh"
 
+#include <optional>
 #include <vector>
 
 namespace secondary_index {
@@ -53,10 +54,14 @@ public:
     static bool is_substring_index(const index_metadata& im);
     /// The `min_gram` the index was created with, or the default.
     static unsigned min_gram(const index_metadata& im);
+    /// The column the index orders its results by, or nothing when it was created without one and
+    /// so answers in unspecified order.
+    static std::optional<sstring> order_by(const index_metadata& im);
 
 private:
     void check_target(const schema& schema, const std::vector<::shared_ptr<cql3::statements::index_target>>& targets) const;
     void check_index_options(const cql3::statements::index_specific_prop_defs& properties) const;
+    void check_order_by_column(const schema& schema, const cql3::statements::index_specific_prop_defs& properties) const;
 };
 
 std::unique_ptr<secondary_index::custom_index> substring_index_factory();

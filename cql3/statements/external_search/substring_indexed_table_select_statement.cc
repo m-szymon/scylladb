@@ -61,6 +61,45 @@ expr::binary_operator find_like_restriction(const restrictions::select_restricti
     return *binop;
 }
 
+/// Checks an ORDER BY against the column the index was created to order by.
+///
+/// The coordinator's own ordering checks are skipped for a substring query (see the guard in
+/// select_statement.cc), so this is the only thing standing between a user and a query that claims
+/// an order the index cannot provide. An index with no sort column can serve no ORDER BY at all:
+/// its results come back in whatever order the walk found them.
+void validate_ordering(const schema& schema, const select_statement::parameters& parameters,
+        const secondary_index::index& index) {
+    const auto& orderings = parameters.orderings();
+    if (orderings.empty()) {
+        return;
+    }
+    if (orderings.size() != 1) {
+        throw exceptions::invalid_request_exception("Substring search queries support ordering by a single column");
+    }
+    auto order_by = secondary_index::substring_index::order_by(index.metadata());
+    if (!order_by) {
+        throw exceptions::invalid_request_exception(
+                "ORDER BY requires the substring index to have been created with an 'order_by' option");
+    }
+    const auto& [raw_column, ordering] = orderings.front();
+    if (!raw_column) {
+        throw exceptions::invalid_request_exception("Substring search queries cannot be ordered by a scoring function");
+    }
+    auto column = raw_column->prepare_column_identifier(schema);
+    if (column->name() != to_bytes(*order_by)) {
+        throw exceptions::invalid_request_exception(format(
+                "Substring search queries can only be ordered by {}, the column the index was created with, not {}",
+                *order_by, column->to_string()));
+    }
+    // The index node walks its sort column from the highest value down, so ascending order would
+    // need it to walk the other way. Nothing here is inherently descending, but nothing takes a
+    // direction either; rejecting is better than quietly answering in the wrong one.
+    if (!std::holds_alternative<raw::select_statement::ordering>(ordering)
+            || std::get<raw::select_statement::ordering>(ordering) != raw::select_statement::ordering::descending) {
+        throw exceptions::invalid_request_exception("Substring search queries can only be ordered DESC");
+    }
+}
+
 } // anonymous namespace
 
 ::shared_ptr<cql3::statements::select_statement> substring_indexed_table_select_statement::prepare(data_dictionary::database db,
@@ -87,6 +126,8 @@ expr::binary_operator find_like_restriction(const restrictions::select_restricti
     if (!restrictions->get_scoring_function_restrictions().empty()) {
         throw exceptions::invalid_request_exception("Substring search queries cannot be combined with scoring functions");
     }
+
+    validate_ordering(*schema, *parameters, index);
 
     const auto like = find_like_restriction(*restrictions, index);
     const auto* target_column = expr::as<expr::column_value>(like.lhs).col;

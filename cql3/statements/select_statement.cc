@@ -2262,7 +2262,12 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
 
     auto orderings = _parameters->orderings();
 
-    if (!orderings.empty() && !is_ann_query && !is_fts_query) {
+    // A substring query is ordered by the index node, like ANN and BM25, so the coordinator-side
+    // ordering machinery is skipped for it too: the clustering-order comparator it would build is
+    // meaningless for a regular column, and re-sorting the page here would fight the cursor the
+    // index node pages with. The ORDER BY is validated instead by the statement itself, which
+    // knows which column the index was created to order by.
+    if (!orderings.empty() && !is_ann_query && !is_fts_query && !is_substring_query) {
         std::visit([&](auto&& ordering) {
             using T = std::decay_t<decltype(ordering)>;
             if constexpr (!std::is_same_v<T, raw::select_statement::scoring_function_ordering>) {
