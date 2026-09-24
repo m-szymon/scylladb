@@ -53,11 +53,8 @@ substring_restrictions find_like_restriction(const restrictions::select_restrict
     // The indexed column carries the LIKE; the sort column, if the index has one, may carry a
     // range alongside it. Nothing else may be restricted -- an unsupported predicate would be left
     // to post-filtering, which these statements do not do, so it would be silently ignored rather
-    // than applied.
-    if (non_pk.size() > (order_by ? 2u : 1u)) {
-        throw exceptions::invalid_request_exception(
-                "Substring search queries support a LIKE on the indexed column, optionally a range on the ordered column, and no other WHERE restrictions");
-    }
+    // than applied. Which column is at fault is worth saying, so the rejection is left to the loop
+    // over the columns below rather than made here on the count.
     auto like_entry = std::ranges::find_if(non_pk, [&](const auto& entry) {
         return entry.first->name_as_text() == index.target_column();
     });
@@ -78,10 +75,16 @@ substring_restrictions find_like_restriction(const restrictions::select_restrict
         if (other_column == column) {
             continue;
         }
-        if (!order_by || other_column->name_as_text() != *order_by) {
+        if (!order_by) {
             throw exceptions::invalid_request_exception(seastar::format(
-                    "Substring search queries cannot restrict {}: only the indexed column {} and the ordered column may be restricted",
+                    "Substring search queries cannot restrict {}: only the indexed column {} may be restricted, because this index "
+                    "was created without an 'order_by' option and so has no other column's values to restrict by",
                     other_column->name_as_text(), index.target_column()));
+        }
+        if (other_column->name_as_text() != *order_by) {
+            throw exceptions::invalid_request_exception(seastar::format(
+                    "Substring search queries cannot restrict {}: only the indexed column {} and the ordered column {} may be restricted",
+                    other_column->name_as_text(), index.target_column(), *order_by));
         }
         // Every factor on the sort column has to be a bound the index node can apply. A predicate
         // left here would be dropped, not applied, because these statements do no post-filtering.
