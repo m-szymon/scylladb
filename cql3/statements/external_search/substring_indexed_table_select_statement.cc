@@ -221,18 +221,22 @@ future<shared_ptr<cql_transport::messages::result_message>> substring_indexed_ta
     // coroutine body becomes the exceptional future the caller expects.
     const auto keyword = evaluate_keyword(options);
 
-    auto pkeys = co_await qp.vector_store_client().contains(
-            _schema->ks_name(), _index.metadata().name(), _schema, std::string(keyword), limit, aoe.abort_source());
-    if (!pkeys.has_value()) {
+    // No cursor yet: paging a substring search still returns the whole result set in one page, and
+    // warns that it did. Threading a cursor through the paging state is what turns this into real
+    // paging, and it is not done here.
+    auto page = co_await qp.vector_store_client().contains(_schema->ks_name(), _index.metadata().name(), _schema,
+            std::string(keyword), limit, std::nullopt, aoe.abort_source());
+    if (!page.has_value()) {
         co_await coroutine::return_exception(
-                exceptions::invalid_request_exception(std::visit(vector_search::vector_store_client::contains_error_visitor{}, pkeys.error())));
+                exceptions::invalid_request_exception(std::visit(vector_search::vector_store_client::contains_error_visitor{}, page.error())));
     }
 
-    throwing_assert(pkeys->size() <= limit);
+    throwing_assert(page->keys.size() <= limit);
 
-    // Nothing ranks the rows, so no score provider: they come back in whatever order the base
-    // table read yields, as with any other LIKE.
-    co_return co_await query_base_table(qp, state, options, pkeys.value(), timeout);
+    // The index node returns the keys in the order it wants them read -- its own for an unordered
+    // index, newest-first for one with a sort column -- and query_base_table preserves that order
+    // on both of its paths, so no score provider and no re-sorting are needed here.
+    co_return co_await query_base_table(qp, state, options, page->keys, timeout);
 }
 
 } // namespace cql3::statements

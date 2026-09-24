@@ -64,6 +64,12 @@ public:
     using limit = std::size_t;
     using port_number = std::uint16_t;
     using primary_keys = std::vector<primary_key>;
+    /// A page of an ordered containment search: the keys, and where the next page resumes.
+    /// `next_cursor` is empty when the index is unordered, or when the page exhausted the matches.
+    struct contains_page {
+        primary_keys keys;
+        std::optional<uint64_t> next_cursor;
+    };
     using schema_ptr = lw_shared_ptr<schema const>;
     using status_type = http::reply::status_type;
 
@@ -125,10 +131,14 @@ public:
             -> future<std::expected<primary_keys, fts_error>>;
 
     /// Request the vector store service for the primary keys of the rows whose indexed value
-    /// contains `keyword` (the `LIKE '%keyword%'` predicate), in the index's own order. Nothing
-    /// ranks them, so the similarity field of every returned primary_key is left at zero.
-    auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit, abort_source& as)
-            -> future<std::expected<primary_keys, contains_error>>;
+    /// contains `keyword` (the `LIKE '%keyword%'` predicate). Nothing ranks them, so the similarity
+    /// field of every returned primary_key is left at zero.
+    ///
+    /// An index created with a sort column answers newest-first and reports where the next page
+    /// resumes; `cursor` carries that back to read it. An unordered index ignores the cursor and
+    /// reports none, which is why ordering is a property of the index rather than of the request.
+    auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit,
+            std::optional<uint64_t> cursor, abort_source& as) -> future<std::expected<contains_page, contains_error>>;
 
     /// Request a fragment of each of the given documents, with the terms of `fts_query` marked.
     ///

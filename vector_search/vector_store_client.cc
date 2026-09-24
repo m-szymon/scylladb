@@ -230,8 +230,26 @@ auto read_bm25_json(rjson::value const& json, schema_ptr const& schema) -> std::
     return read_scored_primary_keys_json(json, schema, "scores");
 }
 
-auto write_contains_json(query_string keyword, limit limit) -> json_content {
-    return seastar::format(R"({{"query":{},"limit":{}}})", rjson::from_string(keyword), limit);
+auto write_contains_json(query_string keyword, limit limit, std::optional<uint64_t> cursor) -> json_content {
+    if (!cursor) {
+        return seastar::format(R"({{"query":{},"limit":{}}})", rjson::from_string(keyword), limit);
+    }
+    return seastar::format(
+            R"({{"query":{},"limit":{},"cursor":{}}})", rjson::from_string(keyword), limit, *cursor);
+}
+
+/// The cursor a page reports, if any. Absent is normal -- an unordered index never reports one --
+/// so only a present-but-wrong value is an error.
+auto read_next_cursor_json(rjson::value const& json) -> std::expected<std::optional<uint64_t>, ann_error> {
+    auto const* cursor_json = rjson::find(json, "next_cursor");
+    if (cursor_json == nullptr || cursor_json->IsNull()) {
+        return std::optional<uint64_t>{};
+    }
+    if (!cursor_json->IsUint64()) {
+        vslogger.error("Vector Store returned invalid JSON: 'next_cursor' is not an unsigned integer");
+        return std::unexpected{service_reply_format_error{}};
+    }
+    return std::optional<uint64_t>{cursor_json->GetUint64()};
 }
 
 /// Reads a reply carrying primary keys and nothing to rank them by, so the number of results is
@@ -527,16 +545,25 @@ struct vector_store_client::impl {
         }
     }
 
-    auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit, abort_source& as)
-            -> future<std::expected<primary_keys, contains_error>> {
+    auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit,
+            std::optional<uint64_t> cursor, abort_source& as) -> future<std::expected<contains_page, contains_error>> {
         auto content = co_await post_to_index("contains", format("/api/v1/indexes/{}/{}/contains", keyspace, name),
-                write_contains_json(std::move(keyword), limit), as);
+                write_contains_json(std::move(keyword), limit, cursor), as);
         if (!content) {
             co_return std::unexpected{content.error()};
         }
 
         try {
-            co_return read_primary_keys_json(rjson::parse(std::move(*content)), schema);
+            auto json = rjson::parse(std::move(*content));
+            auto keys = read_primary_keys_json(json, schema);
+            if (!keys) {
+                co_return std::unexpected{keys.error()};
+            }
+            auto next_cursor = read_next_cursor_json(json);
+            if (!next_cursor) {
+                co_return std::unexpected{next_cursor.error()};
+            }
+            co_return contains_page{std::move(*keys), *next_cursor};
         } catch (const rjson::error& e) {
             vslogger.error("Vector Store returned invalid JSON: {}", e.what());
             co_return std::unexpected{service_reply_format_error{}};
@@ -620,9 +647,9 @@ auto vector_store_client::bm25(keyspace_name keyspace, index_name name, schema_p
     return _impl->bm25(std::move(keyspace), std::move(name), schema, std::move(fts_query), limit, as);
 }
 
-auto vector_store_client::contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit, abort_source& as)
-        -> future<std::expected<primary_keys, contains_error>> {
-    return _impl->contains(std::move(keyspace), std::move(name), schema, std::move(keyword), limit, as);
+auto vector_store_client::contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit,
+        std::optional<uint64_t> cursor, abort_source& as) -> future<std::expected<contains_page, contains_error>> {
+    return _impl->contains(std::move(keyspace), std::move(name), schema, std::move(keyword), limit, cursor, as);
 }
 
 auto vector_store_client::highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents documents, abort_source& as)
