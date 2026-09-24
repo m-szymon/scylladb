@@ -26,6 +26,9 @@ class substring_indexed_table_select_statement : public external_index_select_st
     /// The range restriction on the ordered column, if the query carried one. Kept unevaluated
     /// because a bound may be a bind marker; it is turned into sort keys at execution.
     std::vector<expr::binary_operator> _sort_bounds;
+    /// Whether the index was created with a sort column. Only such an index walks its matches in a
+    /// defined order, and only then is there a position for a later page to resume from.
+    bool _ordered;
 
 public:
     static constexpr size_t max_substring_query_limit = 1000;
@@ -58,10 +61,25 @@ private:
         return "Substring Search";
     }
 
+    bool supports_cursor_paging() const override {
+        return _ordered;
+    }
+
     /// The keyword to search for: the one settled at prepare, or the bound pattern's.
     sstring evaluate_keyword(const query_options& options) const;
     /// The range restriction as the index node's sort-key bounds: {min, max}, either may be empty.
     std::pair<std::optional<uint64_t>, std::optional<uint64_t>> evaluate_sort_bounds(const query_options& options) const;
+
+    /// Where this page starts: the cursor the previous page ended at, and how much of the LIMIT is
+    /// still unspent. The first page of a query, and every page of an unordered index, starts at
+    /// the beginning with the whole LIMIT.
+    std::pair<std::optional<uint64_t>, uint64_t> resume_point(const query_options& options, uint64_t limit) const;
+    /// How many keys to ask the index node for: the page size when the client set one and this
+    /// index can page, otherwise everything still owed.
+    uint64_t page_size_for(const query_options& options, uint64_t remaining) const;
+    /// The paging state to hand the client, or nullptr when this page is the last one.
+    lw_shared_ptr<const service::pager::paging_state> next_page_state(
+            const vector_search::vector_store_client::contains_page& page, uint64_t remaining) const;
 
     future<::shared_ptr<cql_transport::messages::result_message>> execute_search(
             query_processor& qp, service::query_state& state, const query_options& options, uint64_t limit) const override;

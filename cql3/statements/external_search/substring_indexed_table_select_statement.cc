@@ -226,7 +226,8 @@ substring_indexed_table_select_statement::substring_indexed_table_select_stateme
     , _min_gram{min_gram}
     , _keyword{std::move(keyword)}
     , _deferred_pattern{std::move(deferred_pattern)}
-    , _sort_bounds{std::move(sort_bounds)} {
+    , _sort_bounds{std::move(sort_bounds)}
+    , _ordered{secondary_index::substring_index::order_by(index.metadata()).has_value()} {
 }
 
 std::pair<std::optional<uint64_t>, std::optional<uint64_t>>
@@ -267,6 +268,41 @@ substring_indexed_table_select_statement::evaluate_sort_bounds(const query_optio
     return {min, max};
 }
 
+std::pair<std::optional<uint64_t>, uint64_t>
+substring_indexed_table_select_statement::resume_point(const query_options& options, uint64_t limit) const {
+    auto state = options.get_paging_state();
+    if (!_ordered || !state) {
+        return {std::nullopt, limit};
+    }
+    // The state's remaining count is what the first page's LIMIT left over. It is trusted no
+    // further than the statement's own LIMIT, which a client could otherwise exceed by carrying a
+    // paging state from a query with a larger one.
+    return {state->get_index_cursor(), std::min(limit, state->get_remaining())};
+}
+
+uint64_t substring_indexed_table_select_statement::page_size_for(const query_options& options, uint64_t remaining) const {
+    auto page_size = options.get_page_size();
+    if (!_ordered || page_size <= 0) {
+        return remaining;
+    }
+    return std::min(static_cast<uint64_t>(page_size), remaining);
+}
+
+lw_shared_ptr<const service::pager::paging_state> substring_indexed_table_select_statement::next_page_state(
+        const vector_search::vector_store_client::contains_page& page, uint64_t remaining) const {
+    auto left = remaining - page.keys.size();
+    if (!_ordered || !page.next_cursor || left == 0) {
+        return nullptr;
+    }
+    // Only the cursor and the remaining count mean anything here: this statement reads the base
+    // table by primary key rather than scanning it, so there is no partition to resume at and no
+    // saved reader to name. The rest of the state is the neutral value for each field.
+    return make_lw_shared<const service::pager::paging_state>(partition_key::make_empty(), std::nullopt,
+            static_cast<uint32_t>(left), query_id::create_null_id(), service::pager::paging_state::replicas_per_token_range{},
+            std::nullopt, 0, static_cast<uint32_t>(left >> 32), 0, bound_weight::equal, partition_region::partition_start,
+            std::nullopt, *page.next_cursor);
+}
+
 sstring substring_indexed_table_select_statement::evaluate_keyword(const query_options& options) const {
     if (_keyword) {
         return *_keyword;
@@ -299,25 +335,29 @@ future<shared_ptr<cql_transport::messages::result_message>> substring_indexed_ta
     // coroutine body becomes the exceptional future the caller expects.
     const auto keyword = evaluate_keyword(options);
 
-    // No cursor yet: paging a substring search still returns the whole result set in one page, and
-    // warns that it did. Threading a cursor through the paging state is what turns this into real
-    // paging, and it is not done here.
     // Throws for a bound the index cannot range over, or a null one.
     auto [min_sort_key, max_sort_key] = evaluate_sort_bounds(options);
 
+    // An ordered index walks its matches downwards and reports where it stopped, so a page can pick
+    // up from there. Without one there is no defined position to resume from, and the query keeps
+    // the stage-1 shape: one page holding the whole result, with the warning do_execute adds.
+    auto [cursor, remaining] = resume_point(options, limit);
+    auto page_limit = page_size_for(options, remaining);
+
     auto page = co_await qp.vector_store_client().contains(_schema->ks_name(), _index.metadata().name(), _schema,
-            std::string(keyword), limit, std::nullopt, min_sort_key, max_sort_key, aoe.abort_source());
+            std::string(keyword), page_limit, cursor, min_sort_key, max_sort_key, aoe.abort_source());
     if (!page.has_value()) {
         co_await coroutine::return_exception(
                 exceptions::invalid_request_exception(std::visit(vector_search::vector_store_client::contains_error_visitor{}, page.error())));
     }
 
-    throwing_assert(page->keys.size() <= limit);
+    throwing_assert(page->keys.size() <= page_limit);
 
     // The index node returns the keys in the order it wants them read -- its own for an unordered
     // index, newest-first for one with a sort column -- and query_base_table preserves that order
     // on both of its paths, so no score provider and no re-sorting are needed here.
-    co_return co_await query_base_table(qp, state, options, page->keys, timeout);
+    co_return co_await query_base_table(
+            qp, state, options, page->keys, timeout, nullptr, next_page_state(*page, remaining));
 }
 
 } // namespace cql3::statements

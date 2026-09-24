@@ -43,7 +43,8 @@ protected:
 
     future<::shared_ptr<cql_transport::messages::result_message>> query_base_table(query_processor& qp, service::query_state& state,
             const query_options& options, const std::vector<vector_search::primary_key>& pkeys, lowres_clock::time_point timeout,
-            std::unique_ptr<cql3::selection::external_values_provider> provider = nullptr) const;
+            std::unique_ptr<cql3::selection::external_values_provider> provider = nullptr,
+            lw_shared_ptr<const service::pager::paging_state> next_page = nullptr) const;
 
     future<coordinator_result<foreign_ptr<lw_shared_ptr<query::result>>>> query_base_table(query_processor& qp, service::query_state& state,
             const query_options& options, lw_shared_ptr<query::read_command> command, lowres_clock::time_point timeout,
@@ -63,6 +64,13 @@ protected:
 
     bool needs_post_filtering() const override {
         return false; // All filtering is done by the index query, so no post-filtering is allowed.
+    }
+
+    /// Whether this statement can resume from a cursor the index node handed back, and so can
+    /// answer a page at a time. False means the whole result set comes in one page, which is what
+    /// `maybe_add_paging_warning` tells the client.
+    virtual bool supports_cursor_paging() const {
+        return false;
     }
 
 private:

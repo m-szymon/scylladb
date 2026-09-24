@@ -88,12 +88,23 @@ lw_shared_ptr<query::read_command> external_index_select_statement::prepare_comm
 
 future<::shared_ptr<cql_transport::messages::result_message>> external_index_select_statement::query_base_table(query_processor& qp,
         service::query_state& state, const query_options& options, const std::vector<vector_search::primary_key>& pkeys, lowres_clock::time_point timeout,
-        std::unique_ptr<cql3::selection::external_values_provider> provider) const {
+        std::unique_ptr<cql3::selection::external_values_provider> provider,
+        lw_shared_ptr<const service::pager::paging_state> next_page) const {
     auto command = prepare_command_for_base_query(qp, state, options, pkeys.size());
 
     auto result = co_await query_base_table(qp, state, options, command, timeout, pkeys);
 
+    // The statement's LIMIT, not the page's: a page holds at most one row per key asked for, which
+    // is already no more than the LIMIT, so this only declines to truncate.
     command->set_row_limit(get_limit(options, _limit));
+
+    // The metadata is the selection's and outlives the page, so the last page has to clear what an
+    // earlier one left. Set it here, with no preemption point before the result is built from it.
+    if (next_page) {
+        _selection->get_result_metadata()->maybe_set_paging_state(std::move(next_page));
+    } else {
+        _selection->get_result_metadata()->clear_paging_state();
+    }
 
     co_return co_await wrap_result_to_error_message([this, command = std::move(command), &options, provider_ptr = provider.get()](auto query_result) {
         return process_results(std::move(query_result), command, options, _query_start_time_point, provider_ptr);
@@ -163,7 +174,7 @@ void external_index_select_statement::setup_execute(service::query_state& state,
 void external_index_select_statement::maybe_add_paging_warning(
         const ::shared_ptr<cql_transport::messages::result_message>& result, const query_options& options, uint64_t limit) const {
     auto page_size = options.get_page_size();
-    if (page_size > 0 && (uint64_t)page_size < limit) {
+    if (!supports_cursor_paging() && page_size > 0 && (uint64_t)page_size < limit) {
         result->add_warning(fmt::format("Paging is not supported for {} queries. The entire result set has been returned.", index_search_type_name()));
     }
 }

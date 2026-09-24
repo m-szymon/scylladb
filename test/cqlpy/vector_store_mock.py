@@ -49,6 +49,7 @@ class VectorStoreMock:
         self._next_ann_response = Response()
         self._next_bm25_response = BM25Response()
         self._next_contains_response = ContainsResponse()
+        self._contains_responses: list[ContainsResponse] = []
         self._next_status_response = Response(status=200, body='"SERVING"')
         self._server: HTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -88,6 +89,15 @@ class VectorStoreMock:
     def set_next_contains_response(self, status: int, body: str) -> None:
         with self._lock:
             self._next_contains_response = ContainsResponse(status=status, body=body)
+            self._contains_responses = []
+
+    def set_contains_responses(self, responses: list[tuple[int, str]]) -> None:
+        """One response per request, in order, for a query that asks more than once -- a paged one.
+        Once the list runs out the last one is repeated, so a test that gets the page count wrong
+        fails on the rows rather than on a hang."""
+        with self._lock:
+            self._contains_responses = [ContainsResponse(status=s, body=b) for s, b in responses]
+            self._next_contains_response = self._contains_responses[-1]
 
     def set_next_status_response(self, status: int, body: str) -> None:
         with self._lock:
@@ -102,6 +112,7 @@ class VectorStoreMock:
             self._next_ann_response = Response()
             self._next_bm25_response = BM25Response()
             self._next_contains_response = ContainsResponse()
+            self._contains_responses = []
             self._next_status_response = Response(status=200, body='"SERVING"')
 
     def _handle_ann(self, request: Request, send_response: Callable[[Response], None]) -> None:
@@ -119,7 +130,7 @@ class VectorStoreMock:
     def _handle_contains(self, request: Request, send_response: Callable[[ContainsResponse], None]) -> None:
         with self._lock:
             self._contains_requests.append(request)
-            response = self._next_contains_response
+            response = self._contains_responses.pop(0) if self._contains_responses else self._next_contains_response
         send_response(response)
 
     def _handle_status(self, request: Request, send_response: Callable[[Response], None]) -> None:

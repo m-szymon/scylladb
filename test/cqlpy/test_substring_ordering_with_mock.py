@@ -17,6 +17,7 @@ import json
 
 import pytest
 from cassandra.protocol import InvalidRequest
+from cassandra.query import SimpleStatement
 from test.pylib.skip_types import skip_env
 
 from .util import new_test_table, unique_name
@@ -160,17 +161,16 @@ def test_limit_is_still_required_and_capped_when_ordering(cql, ordered_table):
         cql.execute(f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC LIMIT 1001")
 
 
-def test_a_cursor_in_the_reply_is_accepted(cql, ordered_table, vector_store_mock):
-    """The index node reports where the next page resumes. Nothing pages on it yet -- the cursor is
-    read and dropped -- but a reply carrying one must not be rejected as malformed."""
+def test_a_cursor_in_the_reply_ends_the_query_when_the_limit_is_spent(cql, ordered_table, vector_store_mock):
+    """A cursor says only where the next page would start. With the LIMIT already spent there is no
+    next page, so it is dropped and the client is told the result is complete."""
     table, _ = ordered_table
     vector_store_mock.set_next_contains_response(200, contains_response([4, 3], next_cursor=1003))
 
-    rows = list(
-        cql.execute(f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC LIMIT {NUM_ROWS}")
-    )
+    result = cql.execute(f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC LIMIT 2")
 
-    assert [row.id for row in rows] == [4, 3]
+    assert [row.id for row in result] == [4, 3]
+    assert len(vector_store_mock.contains_requests) == 1
 
 
 def test_a_malformed_cursor_is_an_error(cql, ordered_table, vector_store_mock):
@@ -185,3 +185,104 @@ def test_a_malformed_cursor_is_an_error(cql, ordered_table, vector_store_mock):
                 f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC LIMIT {NUM_ROWS}"
             )
         )
+
+
+# --- paging --------------------------------------------------------------------
+
+
+def test_pages_resume_from_the_cursor(cql, ordered_table, vector_store_mock):
+    """Each page asks the index node to carry on from where the last one stopped, and the pages
+    together are the whole result in order."""
+    table, _ = ordered_table
+    vector_store_mock.reset()
+    vector_store_mock.set_contains_responses([
+        (200, contains_response([4, 3], next_cursor=1003)),
+        (200, contains_response([2, 1], next_cursor=1001)),
+        (200, contains_response([0])),
+    ])
+
+    statement = SimpleStatement(
+        f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC LIMIT {NUM_ROWS}",
+        fetch_size=2,
+    )
+    assert [row.id for row in cql.execute(statement)] == [4, 3, 2, 1, 0]
+
+    bodies = [json.loads(request.body) for request in vector_store_mock.contains_requests]
+    assert len(bodies) == 3
+    assert "cursor" not in bodies[0]
+    assert [body["cursor"] for body in bodies[1:]] == [1003, 1001]
+    # Each request asks for a page, not for the whole LIMIT; the last one asks only for what the
+    # LIMIT still owes.
+    assert [body["limit"] for body in bodies] == [2, 2, 1]
+
+
+def test_a_page_without_a_cursor_is_the_last_one(cql, ordered_table, vector_store_mock):
+    """The index node omits the cursor when it has nothing left to walk, and that ends the query
+    even though the LIMIT is not spent."""
+    table, _ = ordered_table
+    vector_store_mock.reset()
+    vector_store_mock.set_contains_responses([(200, contains_response([4, 3]))])
+
+    statement = SimpleStatement(
+        f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC LIMIT {NUM_ROWS}",
+        fetch_size=2,
+    )
+    assert [row.id for row in cql.execute(statement)] == [4, 3]
+    assert len(vector_store_mock.contains_requests) == 1
+
+
+def test_paging_stops_at_the_limit(cql, ordered_table, vector_store_mock):
+    """The LIMIT bounds the whole query, not each page: a node that keeps offering a cursor does not
+    get to return more rows than were asked for."""
+    table, _ = ordered_table
+    vector_store_mock.reset()
+    vector_store_mock.set_contains_responses([
+        (200, contains_response([4, 3], next_cursor=1003)),
+        (200, contains_response([2], next_cursor=1002)),
+    ])
+
+    statement = SimpleStatement(
+        f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC LIMIT 3",
+        fetch_size=2,
+    )
+    assert [row.id for row in cql.execute(statement)] == [4, 3, 2]
+    assert len(vector_store_mock.contains_requests) == 2
+
+
+def test_a_range_is_repeated_on_every_page(cql, ordered_table, vector_store_mock):
+    """The range is part of the query, so the second page has to be filtered by it too -- the cursor
+    narrows where the walk starts, it does not replace the restriction."""
+    table, _ = ordered_table
+    vector_store_mock.reset()
+    vector_store_mock.set_contains_responses([
+        (200, contains_response([4], next_cursor=1004)),
+        (200, contains_response([3])),
+    ])
+
+    statement = SimpleStatement(
+        f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' AND registered_at < 1005 "
+        f"ORDER BY registered_at DESC LIMIT {NUM_ROWS}",
+        fetch_size=1,
+    )
+    assert [row.id for row in cql.execute(statement)] == [4, 3]
+
+    bodies = [json.loads(request.body) for request in vector_store_mock.contains_requests]
+    assert len(bodies) == 2
+    assert all("max_sort_key" in body for body in bodies)
+    assert bodies[0]["max_sort_key"] == bodies[1]["max_sort_key"]
+
+
+def test_an_unordered_index_does_not_page(cql, unordered_table, vector_store_mock):
+    """Without a sort column the walk has no position to resume from, so the query keeps its old
+    shape: the whole result in one page, and a warning saying so."""
+    table, _ = unordered_table
+    vector_store_mock.reset()
+    vector_store_mock.set_next_contains_response(200, contains_response([0, 1, 2, 3]))
+
+    statement = SimpleStatement(
+        f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' LIMIT {NUM_ROWS}", fetch_size=2
+    )
+    result = cql.execute(statement)
+
+    assert sorted(row.id for row in result) == [0, 1, 2, 3]
+    assert len(vector_store_mock.contains_requests) == 1
