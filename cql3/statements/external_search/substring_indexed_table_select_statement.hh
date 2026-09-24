@@ -23,6 +23,9 @@ class substring_indexed_table_select_statement : public external_index_select_st
     // pattern that only execution can evaluate and check, a bind marker standing there.
     std::optional<sstring> _keyword;
     std::optional<expr::expression> _deferred_pattern;
+    /// The range restriction on the ordered column, if the query carried one. Kept unevaluated
+    /// because a bound may be a bind marker; it is turned into sort keys at execution.
+    std::vector<expr::binary_operator> _sort_bounds;
 
 public:
     static constexpr size_t max_substring_query_limit = 1000;
@@ -48,7 +51,7 @@ public:
             std::optional<expr::expression> limit, std::optional<expr::expression> per_partition_limit, cql_stats& stats,
             const secondary_index::index& index, const column_definition* target_column, unsigned min_gram,
             std::optional<sstring> keyword, std::optional<expr::expression> deferred_pattern,
-            std::unique_ptr<cql3::attributes> attrs);
+            std::vector<expr::binary_operator> sort_bounds, std::unique_ptr<cql3::attributes> attrs);
 
 private:
     std::string_view index_search_type_name() const override {
@@ -57,6 +60,8 @@ private:
 
     /// The keyword to search for: the one settled at prepare, or the bound pattern's.
     sstring evaluate_keyword(const query_options& options) const;
+    /// The range restriction as the index node's sort-key bounds: {min, max}, either may be empty.
+    std::pair<std::optional<uint64_t>, std::optional<uint64_t>> evaluate_sort_bounds(const query_options& options) const;
 
     future<::shared_ptr<cql_transport::messages::result_message>> execute_search(
             query_processor& qp, service::query_state& state, const query_options& options, uint64_t limit) const override;

@@ -230,12 +230,21 @@ auto read_bm25_json(rjson::value const& json, schema_ptr const& schema) -> std::
     return read_scored_primary_keys_json(json, schema, "scores");
 }
 
-auto write_contains_json(query_string keyword, limit limit, std::optional<uint64_t> cursor) -> json_content {
-    if (!cursor) {
-        return seastar::format(R"({{"query":{},"limit":{}}})", rjson::from_string(keyword), limit);
+auto write_contains_json(query_string keyword, limit limit, std::optional<uint64_t> cursor,
+        std::optional<uint64_t> min_sort_key, std::optional<uint64_t> max_sort_key) -> json_content {
+    auto body = rjson::empty_object();
+    rjson::add(body, "query", rjson::from_string(keyword));
+    rjson::add(body, "limit", static_cast<uint64_t>(limit));
+    if (cursor) {
+        rjson::add(body, "cursor", *cursor);
     }
-    return seastar::format(
-            R"({{"query":{},"limit":{},"cursor":{}}})", rjson::from_string(keyword), limit, *cursor);
+    if (min_sort_key) {
+        rjson::add(body, "min_sort_key", *min_sort_key);
+    }
+    if (max_sort_key) {
+        rjson::add(body, "max_sort_key", *max_sort_key);
+    }
+    return rjson::print(body);
 }
 
 /// The cursor a page reports, if any. Absent is normal -- an unordered index never reports one --
@@ -545,10 +554,10 @@ struct vector_store_client::impl {
         }
     }
 
-    auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit,
-            std::optional<uint64_t> cursor, abort_source& as) -> future<std::expected<contains_page, contains_error>> {
+    auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit, std::optional<uint64_t> cursor,
+            std::optional<uint64_t> min_sort_key, std::optional<uint64_t> max_sort_key, abort_source& as) -> future<std::expected<contains_page, contains_error>> {
         auto content = co_await post_to_index("contains", format("/api/v1/indexes/{}/{}/contains", keyspace, name),
-                write_contains_json(std::move(keyword), limit, cursor), as);
+                write_contains_json(std::move(keyword), limit, cursor, min_sort_key, max_sort_key), as);
         if (!content) {
             co_return std::unexpected{content.error()};
         }
@@ -647,9 +656,9 @@ auto vector_store_client::bm25(keyspace_name keyspace, index_name name, schema_p
     return _impl->bm25(std::move(keyspace), std::move(name), schema, std::move(fts_query), limit, as);
 }
 
-auto vector_store_client::contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit,
-        std::optional<uint64_t> cursor, abort_source& as) -> future<std::expected<contains_page, contains_error>> {
-    return _impl->contains(std::move(keyspace), std::move(name), schema, std::move(keyword), limit, cursor, as);
+auto vector_store_client::contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit, std::optional<uint64_t> cursor,
+        std::optional<uint64_t> min_sort_key, std::optional<uint64_t> max_sort_key, abort_source& as) -> future<std::expected<contains_page, contains_error>> {
+    return _impl->contains(std::move(keyspace), std::move(name), schema, std::move(keyword), limit, cursor, min_sort_key, max_sort_key, as);
 }
 
 auto vector_store_client::highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents documents, abort_source& as)

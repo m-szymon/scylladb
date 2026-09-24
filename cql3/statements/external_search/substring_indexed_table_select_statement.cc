@@ -24,6 +24,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/coroutine/exception.hh>
+#include <algorithm>
 
 namespace cql3::statements {
 
@@ -37,20 +38,34 @@ sstring bytes_to_text(const bytes& b) {
 
 /// Finds the single `column LIKE pattern` the query is made of, rejecting anything else the
 /// restriction analysis let through.
-expr::binary_operator find_like_restriction(const restrictions::select_restrictions& select_restrictions, const secondary_index::index& index) {
+/// The LIKE on the indexed column, and any range bounds on the ordered column.
+struct substring_restrictions {
+    expr::binary_operator like;
+    std::vector<expr::binary_operator> sort_bounds;
+};
+
+substring_restrictions find_like_restriction(const restrictions::select_restrictions& select_restrictions, const secondary_index::index& index) {
     if (!select_restrictions.partition_key_restrictions_is_empty() || !restrictions::is_empty_restriction(select_restrictions.get_clustering_columns_restrictions())) {
         throw exceptions::invalid_request_exception("Substring search queries do not support additional WHERE restrictions");
     }
     const auto& non_pk = select_restrictions.get_non_pk_restriction();
-    if (non_pk.size() != 1) {
+    auto order_by = secondary_index::substring_index::order_by(index.metadata());
+    // The indexed column carries the LIKE; the sort column, if the index has one, may carry a
+    // range alongside it. Nothing else may be restricted -- an unsupported predicate would be left
+    // to post-filtering, which these statements do not do, so it would be silently ignored rather
+    // than applied.
+    if (non_pk.size() > (order_by ? 2u : 1u)) {
         throw exceptions::invalid_request_exception(
-                "Substring search queries support exactly one LIKE restriction, on the indexed column, and no other WHERE restrictions");
+                "Substring search queries support a LIKE on the indexed column, optionally a range on the ordered column, and no other WHERE restrictions");
     }
-    const auto& [column, restriction] = *non_pk.begin();
-    if (column->name_as_text() != index.target_column()) {
+    auto like_entry = std::ranges::find_if(non_pk, [&](const auto& entry) {
+        return entry.first->name_as_text() == index.target_column();
+    });
+    if (like_entry == non_pk.end()) {
         throw exceptions::invalid_request_exception(
                 seastar::format("Substring search queries must restrict the indexed column {}", index.target_column()));
     }
+    const auto& [column, restriction] = *like_entry;
     // The analysis keeps each column's restrictions as a conjunction of its factors.
     auto factors = expr::boolean_factors(restriction);
     const auto* binop = factors.size() == 1 ? expr::as_if<expr::binary_operator>(&factors.front()) : nullptr;
@@ -58,7 +73,29 @@ expr::binary_operator find_like_restriction(const restrictions::select_restricti
         throw exceptions::invalid_request_exception(
                 seastar::format("Substring search queries support only a single LIKE restriction on the indexed column {}", index.target_column()));
     }
-    return *binop;
+    std::vector<expr::binary_operator> sort_bounds;
+    for (const auto& [other_column, other_restriction] : non_pk) {
+        if (other_column == column) {
+            continue;
+        }
+        if (!order_by || other_column->name_as_text() != *order_by) {
+            throw exceptions::invalid_request_exception(seastar::format(
+                    "Substring search queries cannot restrict {}: only the indexed column {} and the ordered column may be restricted",
+                    other_column->name_as_text(), index.target_column()));
+        }
+        // Every factor on the sort column has to be a bound the index node can apply. A predicate
+        // left here would be dropped, not applied, because these statements do no post-filtering.
+        for (const auto& factor : expr::boolean_factors(other_restriction)) {
+            const auto* bound = expr::as_if<expr::binary_operator>(&factor);
+            if (!bound || !is_slice(bound->op)) {
+                throw exceptions::invalid_request_exception(seastar::format(
+                        "Substring search queries support only range restrictions (<, <=, >, >=) on the ordered column {}",
+                        other_column->name_as_text()));
+            }
+            sort_bounds.push_back(*bound);
+        }
+    }
+    return substring_restrictions{*binop, std::move(sort_bounds)};
 }
 
 /// Checks an ORDER BY against the column the index was created to order by.
@@ -129,7 +166,8 @@ void validate_ordering(const schema& schema, const select_statement::parameters&
 
     validate_ordering(*schema, *parameters, index);
 
-    const auto like = find_like_restriction(*restrictions, index);
+    auto found = find_like_restriction(*restrictions, index);
+    const auto& like = found.like;
     const auto* target_column = expr::as<expr::column_value>(like.lhs).col;
     const unsigned min_gram = secondary_index::substring_index::min_gram(index.metadata());
 
@@ -168,6 +206,7 @@ void validate_ordering(const schema& schema, const select_statement::parameters&
             min_gram,
             std::move(keyword),
             std::move(deferred_pattern),
+            std::move(found.sort_bounds),
             std::move(attrs));
 }
 
@@ -179,14 +218,53 @@ substring_indexed_table_select_statement::substring_indexed_table_select_stateme
         std::optional<expr::expression> per_partition_limit, cql_stats& stats,
         const secondary_index::index& index, const column_definition* target_column, unsigned min_gram,
         std::optional<sstring> keyword, std::optional<expr::expression> deferred_pattern,
-        std::unique_ptr<attributes> attrs)
+        std::vector<expr::binary_operator> sort_bounds, std::unique_ptr<attributes> attrs)
     : external_index_select_statement{schema, bound_terms, parameters, selection, restrictions,
               group_by_cell_indices, is_reversed, ordering_comparator, limit, per_partition_limit,
               stats, index, std::move(attrs)}
     , _target_column{target_column}
     , _min_gram{min_gram}
     , _keyword{std::move(keyword)}
-    , _deferred_pattern{std::move(deferred_pattern)} {
+    , _deferred_pattern{std::move(deferred_pattern)}
+    , _sort_bounds{std::move(sort_bounds)} {
+}
+
+std::pair<std::optional<uint64_t>, std::optional<uint64_t>>
+substring_indexed_table_select_statement::evaluate_sort_bounds(const query_options& options) const {
+    std::optional<uint64_t> min;
+    std::optional<uint64_t> max;
+    for (const auto& bound : _sort_bounds) {
+        auto value = expr::evaluate(bound.rhs, options);
+        if (value.is_null()) {
+            throw exceptions::invalid_request_exception("A range bound of a substring search query must not be null");
+        }
+        const auto* column = expr::as<expr::column_value>(bound.lhs).col;
+        auto bytes = to_bytes(value.view());
+        auto key = secondary_index::to_sort_key(*column->type, bytes);
+        if (!key) {
+            throw exceptions::invalid_request_exception(seastar::format(
+                    "Substring search queries cannot range over column {} of type {}", column->name_as_text(), column->type->name()));
+        }
+        // An exclusive bound is narrowed to the inclusive one next to it, because the index node's
+        // range bounds are inclusive. Sort keys are integers, so the neighbour is exact.
+        switch (bound.op) {
+        case expr::oper_t::GT:
+            min = std::max(min.value_or(0), *key == std::numeric_limits<uint64_t>::max() ? *key : *key + 1);
+            break;
+        case expr::oper_t::GTE:
+            min = std::max(min.value_or(0), *key);
+            break;
+        case expr::oper_t::LT:
+            max = std::min(max.value_or(std::numeric_limits<uint64_t>::max()), *key == 0 ? *key : *key - 1);
+            break;
+        case expr::oper_t::LTE:
+            max = std::min(max.value_or(std::numeric_limits<uint64_t>::max()), *key);
+            break;
+        default:
+            on_internal_error(sslogger, "a non-slice bound reached evaluate_sort_bounds");
+        }
+    }
+    return {min, max};
 }
 
 sstring substring_indexed_table_select_statement::evaluate_keyword(const query_options& options) const {
@@ -224,8 +302,11 @@ future<shared_ptr<cql_transport::messages::result_message>> substring_indexed_ta
     // No cursor yet: paging a substring search still returns the whole result set in one page, and
     // warns that it did. Threading a cursor through the paging state is what turns this into real
     // paging, and it is not done here.
+    // Throws for a bound the index cannot range over, or a null one.
+    auto [min_sort_key, max_sort_key] = evaluate_sort_bounds(options);
+
     auto page = co_await qp.vector_store_client().contains(_schema->ks_name(), _index.metadata().name(), _schema,
-            std::string(keyword), limit, std::nullopt, aoe.abort_source());
+            std::string(keyword), limit, std::nullopt, min_sort_key, max_sort_key, aoe.abort_source());
     if (!page.has_value()) {
         co_await coroutine::return_exception(
                 exceptions::invalid_request_exception(std::visit(vector_search::vector_store_client::contains_error_visitor{}, page.error())));

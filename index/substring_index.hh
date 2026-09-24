@@ -19,6 +19,16 @@
 
 namespace secondary_index {
 
+/// The integer a substring index orders a value of `type` by, or nothing when the type has no such
+/// image.
+///
+/// **This must agree, bit for bit, with `to_sort_key` in the index node** (vector-store,
+/// `cql_types.rs`): the node stores the key this produces a bound for, so a disagreement would
+/// filter on one ordering and sort by another, dropping rows from the middle of a result rather
+/// than raising an error. Signed values are biased by flipping the sign bit, because a plain cast
+/// would sort every negative value above every positive one.
+std::optional<uint64_t> to_sort_key(const abstract_type& type, bytes_view value);
+
 /// An index answering `LIKE '%keyword%'` on a text column: the Vector Store indexes every
 /// substring of a value between `min_gram` and `max_gram` characters, so containment is an exact
 /// lookup rather than a scan.

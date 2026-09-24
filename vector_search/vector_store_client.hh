@@ -137,8 +137,8 @@ public:
     /// An index created with a sort column answers newest-first and reports where the next page
     /// resumes; `cursor` carries that back to read it. An unordered index ignores the cursor and
     /// reports none, which is why ordering is a property of the index rather than of the request.
-    auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit,
-            std::optional<uint64_t> cursor, abort_source& as) -> future<std::expected<contains_page, contains_error>>;
+    auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit, std::optional<uint64_t> cursor,
+            std::optional<uint64_t> min_sort_key, std::optional<uint64_t> max_sort_key, abort_source& as) -> future<std::expected<contains_page, contains_error>>;
 
     /// Request a fragment of each of the given documents, with the terms of `fts_query` marked.
     ///
