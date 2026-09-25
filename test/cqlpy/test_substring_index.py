@@ -109,6 +109,28 @@ def test_create_substring_index_min_gram_above_max_gram_fails(cql, test_keyspace
         )
 
 
+def test_create_substring_index_with_placeholder_options(cql, test_keyspace):
+    """The poc_option_N placeholders take any non-empty value and are stored for the index node."""
+    schema = 'p int primary key, nickname text'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        index_name = unique_name()
+        cql.execute(
+            f"CREATE CUSTOM INDEX {index_name} ON {table}(nickname) USING 'substring_index' "
+            f"WITH OPTIONS = {{'poc_option_1': 'true', 'poc_option_4': 'anything goes'}}"
+        )
+        options = cql.execute(
+            f"SELECT options FROM system_schema.indexes WHERE keyspace_name = '{test_keyspace}' "
+            f"AND table_name = '{table.split('.')[1]}' AND index_name = '{index_name}'"
+        ).one().options
+        assert options['poc_option_1'] == 'true'
+        assert options['poc_option_4'] == 'anything goes'
+        with pytest.raises(InvalidRequest, match="must not be empty"):
+            cql.execute(
+                f"CREATE CUSTOM INDEX ON {table}(nickname) USING 'substring_index' "
+                f"WITH OPTIONS = {{'poc_option_2': ''}}"
+            )
+
+
 def test_create_substring_index_with_unsupported_option_fails(cql, test_keyspace):
     """Unknown WITH OPTIONS keys should be rejected."""
     schema = 'p int primary key, nickname text'

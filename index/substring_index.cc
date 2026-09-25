@@ -24,6 +24,12 @@ const sstring max_gram_option = "max_gram";
 const sstring case_sensitive_option = "case_sensitive";
 const sstring order_by_option = "order_by";
 
+void validate_placeholder_option(std::string_view index, const sstring& name, const sstring& value) {
+    if (value.empty()) {
+        throw exceptions::invalid_request_exception(format("Index {}: option '{}' must not be empty", index, name));
+    }
+}
+
 const std::unordered_map<sstring, std::function<void(std::string_view, const sstring&, const sstring&)>> substring_index_options = {
         // The length in characters of the shortest indexed substring. A shorter keyword cannot be answered.
         {min_gram_option, std::bind_front(util::validate_positive_option, substring_index::max_gram_limit)},
@@ -41,6 +47,13 @@ const std::unordered_map<sstring, std::function<void(std::string_view, const sst
                          format("Index {}: option '{}' must name a column", index, name));
              }
          }},
+        // Placeholders handed through to the index node untouched, so that an experimental knob on
+        // its side can be set per index without a change here. What each one means is the index
+        // node's business and may change between builds; nothing on this side reads them.
+        {"poc_option_1", validate_placeholder_option},
+        {"poc_option_2", validate_placeholder_option},
+        {"poc_option_3", validate_placeholder_option},
+        {"poc_option_4", validate_placeholder_option},
 };
 
 /// Reads an already validated positive integer option, or the default when absent.
