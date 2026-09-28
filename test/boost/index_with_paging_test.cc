@@ -123,7 +123,7 @@ SEASTAR_TEST_CASE(test_query_plan_survives_paging_state_serialization) {
     auto round_trip = [&] (std::optional<query_plan> plan) {
         auto state = paging_state(pk, std::nullopt, 0, query_id::create_null_id(),
                 paging_state::replicas_per_token_range{}, std::nullopt, 0, 0, 0,
-                bound_weight::equal, partition_region::partition_start, std::move(plan));
+                bound_weight::equal, partition_region::partition_start, std::move(plan), std::nullopt);
         return paging_state::deserialize(state.serialize())->get_query_plan();
     };
 
