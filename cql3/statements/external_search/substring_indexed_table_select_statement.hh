@@ -9,19 +9,20 @@
 #pragma once
 
 #include "external_index_select_statement.hh"
+#include "cql3/statements/external_search/substring_pattern.hh"
 
 #include <optional>
 
 namespace cql3::statements {
 
-/// `SELECT ... WHERE column LIKE '%keyword%' LIMIT n` on a column with a substring index: the
+/// `SELECT ... WHERE column LIKE '%keyword%' LIMIT n` (or `'keyword%'`, `'%keyword'`) on a column with a substring index: the
 /// Vector Store answers the containment and the rows are then read from the base table.
 class substring_indexed_table_select_statement : public external_index_select_statement {
     const column_definition* _target_column;
     unsigned _min_gram;
-    // Exactly one of the two is set: the keyword a literal pattern yielded at prepare, or the
-    // pattern that only execution can evaluate and check, a bind marker standing there.
-    std::optional<sstring> _keyword;
+    // Exactly one of the two is set: the keyword and kind a literal pattern yielded at prepare, or
+    // the pattern that only execution can evaluate and check, a bind marker standing there.
+    std::optional<external_search::contains_pattern> _pattern;
     std::optional<expr::expression> _deferred_pattern;
     /// The range restriction on the ordered column, if the query carried one. Kept unevaluated
     /// because a bound may be a bind marker; it is turned into sort keys at execution.
@@ -29,6 +30,9 @@ class substring_indexed_table_select_statement : public external_index_select_st
     /// Whether the index was created with a sort column. Only such an index walks its matches in a
     /// defined order, and only then is there a position for a later page to resume from.
     bool _ordered;
+    /// The direction the query's ORDER BY asked for, empty when it had none. It is sent to the
+    /// index node, which walks its sort column that way; without one the node picks its default.
+    std::optional<vector_search::vector_store_client::contains_order> _order;
 
 public:
     static constexpr size_t max_substring_query_limit = 1000;
@@ -53,8 +57,9 @@ public:
             ::shared_ptr<std::vector<size_t>> group_by_cell_indices, bool is_reversed, ordering_comparator_type ordering_comparator,
             std::optional<expr::expression> limit, std::optional<expr::expression> per_partition_limit, cql_stats& stats,
             const secondary_index::index& index, const column_definition* target_column, unsigned min_gram,
-            std::optional<sstring> keyword, std::optional<expr::expression> deferred_pattern,
-            std::vector<expr::binary_operator> sort_bounds, std::unique_ptr<cql3::attributes> attrs);
+            std::optional<external_search::contains_pattern> pattern, std::optional<expr::expression> deferred_pattern,
+            std::vector<expr::binary_operator> sort_bounds, std::optional<vector_search::vector_store_client::contains_order> order,
+            std::unique_ptr<cql3::attributes> attrs);
 
 private:
     std::string_view index_search_type_name() const override {
@@ -65,15 +70,15 @@ private:
         return _ordered;
     }
 
-    /// The keyword to search for: the one settled at prepare, or the bound pattern's.
-    sstring evaluate_keyword(const query_options& options) const;
+    /// The keyword to search for and where it has to sit: settled at prepare, or the bound pattern's.
+    external_search::contains_pattern evaluate_pattern(const query_options& options) const;
     /// The range restriction as the index node's sort-key bounds: {min, max}, either may be empty.
     std::pair<std::optional<uint64_t>, std::optional<uint64_t>> evaluate_sort_bounds(const query_options& options) const;
 
     /// Where this page starts: the cursor the previous page ended at, and how much of the LIMIT is
     /// still unspent. The first page of a query, and every page of an unordered index, starts at
-    /// the beginning with the whole LIMIT.
-    std::pair<std::optional<uint64_t>, uint64_t> resume_point(const query_options& options, uint64_t limit) const;
+    /// the beginning with the whole LIMIT. The cursor is the index node's, carried back uninterpreted.
+    std::pair<std::optional<sstring>, uint64_t> resume_point(const query_options& options, uint64_t limit) const;
     /// How many keys to ask the index node for: the page size when the client set one and this
     /// index can page, otherwise everything still owed.
     uint64_t page_size_for(const query_options& options, uint64_t remaining) const;

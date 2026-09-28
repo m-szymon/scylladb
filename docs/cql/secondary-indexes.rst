@@ -408,7 +408,8 @@ Substring Index :label-note:`ScyllaDB Cloud`
    Substring indexes are supported in ScyllaDB Cloud only in clusters that have the Vector and Text Search feature enabled.
    For the full description, see the :doc:`Substring Search documentation </features/substring-search>`.
 
-A substring index answers ``LIKE '%keyword%'`` filters on a text column without ``ALLOW FILTERING``.
+A substring index answers ``LIKE '%keyword%'``, ``LIKE 'keyword%'`` and ``LIKE '%keyword'`` filters on a
+text column without ``ALLOW FILTERING``.
 Instead of tokenizing the text into words, as a :ref:`full-text index <create-fulltext-index-statement>`
 does, it indexes every substring of the value between ``min_gram`` and ``max_gram`` characters long, so
 containment of a keyword is an exact lookup rather than a scan of the table. It is meant for short

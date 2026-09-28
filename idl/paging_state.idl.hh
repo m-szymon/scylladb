@@ -50,7 +50,7 @@ class paging_state {
     // The plan that produced this state, disengaged when none was recorded.
     std::optional<std::variant<service::pager::primary_index_plan, service::pager::index_plan>> get_query_plan() [[version 2026.4]] = std::nullopt;
     // Where an external index node resumes from, disengaged when there is none.
-    std::optional<uint64_t> get_index_cursor() [[version 2026.4]] = std::nullopt;
+    std::optional<sstring> get_index_cursor() [[version 2026.4]] = std::nullopt;
 };
 }
 }

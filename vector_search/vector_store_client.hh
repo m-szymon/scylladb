@@ -66,9 +66,22 @@ public:
     using primary_keys = std::vector<primary_key>;
     /// A page of an ordered containment search: the keys, and where the next page resumes.
     /// `next_cursor` is empty when the index is unordered, or when the page exhausted the matches.
+    /// It is the index node's own position, passed back to it unchanged and never parsed here.
     struct contains_page {
         primary_keys keys;
-        std::optional<uint64_t> next_cursor;
+        std::optional<sstring> next_cursor;
+    };
+    /// The direction an ordered containment search walks its sort column in.
+    enum class contains_order {
+        ascending,
+        descending,
+    };
+    /// Where in the indexed value the keyword has to sit: anywhere (`LIKE '%keyword%'`), at its
+    /// start (`LIKE 'keyword%'`) or at its end (`LIKE '%keyword'`).
+    enum class contains_kind {
+        containment,
+        prefix,
+        suffix,
     };
     using schema_ptr = lw_shared_ptr<schema const>;
     using status_type = http::reply::status_type;
@@ -131,14 +144,17 @@ public:
             -> future<std::expected<primary_keys, fts_error>>;
 
     /// Request the vector store service for the primary keys of the rows whose indexed value
-    /// contains `keyword` (the `LIKE '%keyword%'` predicate). Nothing ranks them, so the similarity
+    /// contains `keyword` (the `LIKE '%keyword%'` predicate), or starts or ends with it when `kind`
+    /// says so (`LIKE 'keyword%'` and `LIKE '%keyword'`). Nothing ranks them, so the similarity
     /// field of every returned primary_key is left at zero.
     ///
-    /// An index created with a sort column answers newest-first and reports where the next page
-    /// resumes; `cursor` carries that back to read it. An unordered index ignores the cursor and
-    /// reports none, which is why ordering is a property of the index rather than of the request.
-    auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit, std::optional<uint64_t> cursor,
-            std::optional<uint64_t> min_sort_key, std::optional<uint64_t> max_sort_key, abort_source& as) -> future<std::expected<contains_page, contains_error>>;
+    /// An index created with a sort column answers in `order` -- descending when none is given --
+    /// and reports where the next page resumes; `cursor` carries that back to read it. An
+    /// unordered index ignores both and reports no cursor, which is why the ability to order is a
+    /// property of the index rather than of the request.
+    auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, contains_kind kind, limit limit,
+            std::optional<sstring> cursor, std::optional<contains_order> order, std::optional<uint64_t> min_sort_key, std::optional<uint64_t> max_sort_key,
+            abort_source& as) -> future<std::expected<contains_page, contains_error>>;
 
     /// Request a fragment of each of the given documents, with the terms of `fts_query` marked.
     ///

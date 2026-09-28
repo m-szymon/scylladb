@@ -5,12 +5,16 @@
 ###############################################################################
 # Tests for ORDER BY on a substring-indexed query.
 #
-# A substring index created with an 'order_by' option answers newest-first, and a
-# query against it may say ORDER BY <that column> DESC. The ordering is done by
-# the index node, so what is checked here is the CQL surface -- which clauses are
-# accepted, which are refused, and that the order the index node chose survives
-# the base-table read -- rather than the ordering itself, which is the index
-# node's own test.
+# A substring index created with an 'order_by' option answers in sort-column
+# order, and a query against it may say ORDER BY <that column> ASC or DESC. The
+# ordering is done by the index node, so what is checked here is the CQL surface
+# -- which clauses are accepted, which are refused, which direction is sent to
+# the index node, and that the order the index node chose survives the
+# base-table read -- rather than the ordering itself, which is the index node's
+# own test.
+#
+# The cursor a page hands back is the index node's own: an opaque string that
+# Scylla carries into the paging state and back into the next request unchanged.
 ###############################################################################
 
 import json
@@ -118,6 +122,55 @@ def test_order_by_the_index_column_is_accepted(cql, ordered_table, vector_store_
     assert [row.id for row in rows] == [3, 1, 4]
 
 
+def test_descending_order_is_sent_to_the_index_node(cql, ordered_table, vector_store_mock):
+    """ORDER BY ... DESC is passed on as 'order': 'desc'. The node would default to it anyway, but
+    a query that names a direction should not rely on the default staying what it is."""
+    table, _ = ordered_table
+    vector_store_mock.reset()
+    vector_store_mock.set_next_contains_response(200, contains_response([4, 3]))
+
+    rows = list(
+        cql.execute(f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC LIMIT {NUM_ROWS}")
+    )
+
+    assert [row.id for row in rows] == [4, 3]
+    assert [request.order for request in vector_store_mock.contains_requests] == ["desc"]
+
+
+def test_ascending_order_is_accepted_and_sent_to_the_index_node(cql, ordered_table, vector_store_mock):
+    """ORDER BY ... ASC is passed on as 'order': 'asc', and the rows are returned as the index node
+    ordered them: Scylla does not re-sort a page it did not order."""
+    table, _ = ordered_table
+    vector_store_mock.reset()
+    vector_store_mock.set_next_contains_response(200, contains_response([0, 1, 2]))
+
+    rows = list(
+        cql.execute(f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at ASC LIMIT {NUM_ROWS}")
+    )
+
+    assert [row.id for row in rows] == [0, 1, 2]
+    assert [request.order for request in vector_store_mock.contains_requests] == ["asc"]
+
+
+def test_a_query_without_order_by_names_no_direction(cql, ordered_table, vector_store_mock):
+    """Without an ORDER BY there is no direction to send, so the field is left out and the index
+    node applies its own default. A range on the ordered column does not change that."""
+    table, _ = ordered_table
+    vector_store_mock.reset()
+    vector_store_mock.set_next_contains_response(200, contains_response([2, 0]))
+
+    rows = list(
+        cql.execute(f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' AND registered_at < 1005 LIMIT {NUM_ROWS}")
+    )
+
+    assert sorted(row.id for row in rows) == [0, 2]
+    requests = vector_store_mock.contains_requests
+    assert len(requests) == 1
+    assert requests[0].order is None
+    assert "order" not in json.loads(requests[0].body)
+    assert "max_sort_key" in json.loads(requests[0].body)
+
+
 def test_order_by_a_different_column_is_rejected(cql, ordered_table):
     """Only the column the index was created with can be ordered by: the index has no other
     column's values to order on."""
@@ -126,12 +179,13 @@ def test_order_by_a_different_column_is_rejected(cql, ordered_table):
         cql.execute(f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY id DESC LIMIT {NUM_ROWS}")
 
 
-def test_ascending_order_is_rejected(cql, ordered_table):
-    """The index node walks its sort column downwards; ascending would need the other direction,
-    and answering in the wrong order is worse than refusing."""
+def test_multiple_orderings_are_rejected(cql, ordered_table):
+    """The index has one sort column, so there is nothing a second ordering could be applied to."""
     table, _ = ordered_table
-    with pytest.raises(InvalidRequest, match="only be ordered DESC"):
-        cql.execute(f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at ASC LIMIT {NUM_ROWS}")
+    with pytest.raises(InvalidRequest, match="ordering by a single column"):
+        cql.execute(
+            f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC, id ASC LIMIT {NUM_ROWS}"
+        )
 
 
 def test_order_by_without_the_index_option_is_rejected(cql, unordered_table):
@@ -165,7 +219,7 @@ def test_a_cursor_in_the_reply_ends_the_query_when_the_limit_is_spent(cql, order
     """A cursor says only where the next page would start. With the LIMIT already spent there is no
     next page, so it is dropped and the client is told the result is complete."""
     table, _ = ordered_table
-    vector_store_mock.set_next_contains_response(200, contains_response([4, 3], next_cursor=1003))
+    vector_store_mock.set_next_contains_response(200, contains_response([4, 3], next_cursor="1003:3"))
 
     result = cql.execute(f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC LIMIT 2")
 
@@ -174,10 +228,10 @@ def test_a_cursor_in_the_reply_ends_the_query_when_the_limit_is_spent(cql, order
 
 
 def test_a_malformed_cursor_is_an_error(cql, ordered_table, vector_store_mock):
-    """A cursor that is present but not a number means the two sides disagree about the protocol,
+    """A cursor that is present but not a string means the two sides disagree about the protocol,
     which is worth failing on rather than silently paging from nowhere."""
     table, _ = ordered_table
-    vector_store_mock.set_next_contains_response(200, json.dumps({"primary_keys": {"id": [1]}, "next_cursor": "soon"}))
+    vector_store_mock.set_next_contains_response(200, json.dumps({"primary_keys": {"id": [1]}, "next_cursor": 1003}))
 
     with pytest.raises(Exception):
         list(
@@ -195,9 +249,10 @@ def test_pages_resume_from_the_cursor(cql, ordered_table, vector_store_mock):
     together are the whole result in order."""
     table, _ = ordered_table
     vector_store_mock.reset()
+    # The cursors are whatever the index node chose to say; Scylla must hand them back verbatim.
     vector_store_mock.set_contains_responses([
-        (200, contains_response([4, 3], next_cursor=1003)),
-        (200, contains_response([2, 1], next_cursor=1001)),
+        (200, contains_response([4, 3], next_cursor="1003:3")),
+        (200, contains_response([2, 1], next_cursor="1001:1")),
         (200, contains_response([0])),
     ])
 
@@ -207,13 +262,39 @@ def test_pages_resume_from_the_cursor(cql, ordered_table, vector_store_mock):
     )
     assert [row.id for row in cql.execute(statement)] == [4, 3, 2, 1, 0]
 
-    bodies = [json.loads(request.body) for request in vector_store_mock.contains_requests]
+    requests = vector_store_mock.contains_requests
+    bodies = [json.loads(request.body) for request in requests]
     assert len(bodies) == 3
     assert "cursor" not in bodies[0]
-    assert [body["cursor"] for body in bodies[1:]] == [1003, 1001]
+    assert [body["cursor"] for body in bodies[1:]] == ["1003:3", "1001:1"]
+    assert [request.cursor for request in requests] == [None, "1003:3", "1001:1"]
+    # Every page carries the direction, so the node walks the same way on each.
+    assert [request.order for request in requests] == ["desc"] * 3
     # Each request asks for a page, not for the whole LIMIT; the last one asks only for what the
     # LIMIT still owes.
     assert [body["limit"] for body in bodies] == [2, 2, 1]
+
+
+def test_ascending_pages_resume_from_the_cursor(cql, ordered_table, vector_store_mock):
+    """Paging is the same walk in the other direction: the cursor goes back verbatim, and every
+    page asks for ascending order so the node does not turn around halfway."""
+    table, _ = ordered_table
+    vector_store_mock.reset()
+    vector_store_mock.set_contains_responses([
+        (200, contains_response([0, 1], next_cursor="1001:1")),
+        (200, contains_response([2, 3], next_cursor="1003:3")),
+        (200, contains_response([4])),
+    ])
+
+    statement = SimpleStatement(
+        f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at ASC LIMIT {NUM_ROWS}",
+        fetch_size=2,
+    )
+    assert [row.id for row in cql.execute(statement)] == [0, 1, 2, 3, 4]
+
+    requests = vector_store_mock.contains_requests
+    assert [request.cursor for request in requests] == [None, "1001:1", "1003:3"]
+    assert [request.order for request in requests] == ["asc"] * 3
 
 
 def test_a_page_without_a_cursor_is_the_last_one(cql, ordered_table, vector_store_mock):
@@ -237,8 +318,8 @@ def test_paging_stops_at_the_limit(cql, ordered_table, vector_store_mock):
     table, _ = ordered_table
     vector_store_mock.reset()
     vector_store_mock.set_contains_responses([
-        (200, contains_response([4, 3], next_cursor=1003)),
-        (200, contains_response([2], next_cursor=1002)),
+        (200, contains_response([4, 3], next_cursor="1003:3")),
+        (200, contains_response([2], next_cursor="1002:2")),
     ])
 
     statement = SimpleStatement(
@@ -255,7 +336,7 @@ def test_a_range_is_repeated_on_every_page(cql, ordered_table, vector_store_mock
     table, _ = ordered_table
     vector_store_mock.reset()
     vector_store_mock.set_contains_responses([
-        (200, contains_response([4], next_cursor=1004)),
+        (200, contains_response([4], next_cursor="1004:4")),
         (200, contains_response([3])),
     ])
 

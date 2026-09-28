@@ -50,9 +50,9 @@ private:
     // Where an external index node should resume from, std::nullopt when the
     // producer had no such position - every query type but a substring search
     // over an ordered index, and any version predating this field. It is the
-    // index node's own sort key, opaque here: the coordinator carries it back
+    // index node's own position, opaque here: the coordinator carries it back
     // and forth without interpreting it.
-    std::optional<uint64_t> _index_cursor;
+    std::optional<sstring> _index_cursor;
 
 public:
     // IDL ctor
@@ -68,7 +68,7 @@ public:
             bound_weight ck_weight,
             partition_region region,
             std::optional<query_plan> plan,
-            std::optional<uint64_t> index_cursor);
+            std::optional<sstring> index_cursor);
 
     paging_state(partition_key pk,
             position_in_partition_view pos,
@@ -78,7 +78,7 @@ public:
             std::optional<db::read_repair_decision> query_read_repair_decision,
             uint64_t rows_fetched_for_last_partition,
             std::optional<query_plan> plan,
-            std::optional<uint64_t> index_cursor = std::nullopt);
+            std::optional<sstring> index_cursor = std::nullopt);
 
     void set_partition_key(partition_key pk) {
         _partition_key = std::move(pk);
@@ -100,7 +100,7 @@ public:
         return _query_plan;
     }
 
-    const std::optional<uint64_t>& get_index_cursor() const {
+    const std::optional<sstring>& get_index_cursor() const {
         return _index_cursor;
     }
 

@@ -528,8 +528,8 @@ Substring search queries (LIKE) :label-note:`ScyllaDB Cloud`
    For more information, see the :doc:`Substring Search documentation </features/substring-search>`.
 
 On a column that has a :ref:`substring index <create-substring-index-statement>`, a ``LIKE`` filter of the
-form ``'%keyword%'`` is answered by the index instead of by a filtered scan, so it needs no
-``ALLOW FILTERING``:
+form ``'%keyword%'``, ``'keyword%'`` or ``'%keyword'`` is answered by the index instead of by a filtered
+scan, so it needs no ``ALLOW FILTERING``:
 
 .. code-block::
 
@@ -545,9 +545,10 @@ Example::
 
 The rules are:
 
-* The pattern must start and end with ``%``, and the keyword between them must contain neither the
-  wildcards ``%`` and ``_`` nor the escape ``\``. Any other pattern, such as a prefix ``'kw%'``, is not
-  served by the index and behaves exactly as on a column without one: it requires ``ALLOW FILTERING``
+* The pattern must be a keyword with ``%`` on both sides (``'%kw%'``, containment), only after it
+  (``'kw%'``, prefix) or only before it (``'%kw'``, suffix), and the keyword must contain neither the
+  wildcards ``%`` and ``_`` nor the escape ``\``. Any other pattern, such as ``'%a%b%'`` or ``'a_b'``, is
+  not served by the index and behaves exactly as on a column without one: it requires ``ALLOW FILTERING``
   and scans the table.
 * The keyword must be at least ``min_gram`` characters long, counted in characters, not bytes.
 * A bind marker may stand for the pattern (``LIKE ?``). The index is chosen when the statement is

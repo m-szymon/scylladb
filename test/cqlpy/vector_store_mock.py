@@ -12,6 +12,7 @@ local Scylla process.
 from collections.abc import Callable
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
 import threading
 
 
@@ -19,6 +20,30 @@ import threading
 class Request:
     path: str
     body: str
+
+
+@dataclass
+class ContainsRequest(Request):
+    """A `/contains` request with the paging, ordering and kind fields of its body picked out.
+
+    `cursor` is the opaque string a previous reply's `next_cursor` handed back, `order` is
+    "asc" or "desc", `kind` is "prefix" or "suffix" (a containment request carries none); each is
+    None when the body omits it. The raw body stays in `body`.
+    """
+    cursor: str | None = None
+    order: str | None = None
+    kind: str | None = None
+
+    @classmethod
+    def from_request(cls, request: Request) -> "ContainsRequest":
+        try:
+            fields = json.loads(request.body)
+        except ValueError:
+            fields = {}
+        if not isinstance(fields, dict):
+            fields = {}
+        return cls(path=request.path, body=request.body, cursor=fields.get("cursor"), order=fields.get("order"),
+                   kind=fields.get("kind"))
 
 
 @dataclass
@@ -43,7 +68,7 @@ class VectorStoreMock:
     def __init__(self):
         self._ann_requests: list[Request] = []
         self._bm25_requests: list[Request] = []
-        self._contains_requests: list[Request] = []
+        self._contains_requests: list[ContainsRequest] = []
         self._status_requests: list[Request] = []
         self._lock = threading.Lock()
         self._next_ann_response = Response()
@@ -69,7 +94,7 @@ class VectorStoreMock:
             return self._bm25_requests.copy()
 
     @property
-    def contains_requests(self) -> list[Request]:
+    def contains_requests(self) -> list[ContainsRequest]:
         with self._lock:
             return self._contains_requests.copy()
 
@@ -129,7 +154,7 @@ class VectorStoreMock:
 
     def _handle_contains(self, request: Request, send_response: Callable[[ContainsResponse], None]) -> None:
         with self._lock:
-            self._contains_requests.append(request)
+            self._contains_requests.append(ContainsRequest.from_request(request))
             response = self._contains_responses.pop(0) if self._contains_responses else self._next_contains_response
         send_response(response)
 

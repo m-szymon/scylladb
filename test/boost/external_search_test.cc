@@ -118,31 +118,56 @@ BOOST_AUTO_TEST_CASE(unevaluated_equality_leaves_the_rest_to_execution) {
     BOOST_REQUIRE(unevaluated_equality(to_text(), to_text()) == equality::unknown);
 }
 
-BOOST_AUTO_TEST_CASE(parse_contains_pattern_accepts_only_infix_keywords) {
-    BOOST_REQUIRE_EQUAL(parse_contains_pattern("%abc%", 1).value(), "abc");
-    BOOST_REQUIRE_EQUAL(parse_contains_pattern("%a b%", 1).value(), "a b");
-    BOOST_REQUIRE_EQUAL(parse_contains_pattern("%a%", 1).value(), "a");
+using contains_kind = vector_search::vector_store_client::contains_kind;
+
+BOOST_AUTO_TEST_CASE(parse_contains_pattern_reads_the_keyword_and_its_kind) {
+    auto parsed = parse_contains_pattern("%abc%", 1).value();
+    BOOST_REQUIRE_EQUAL(parsed.keyword, "abc");
+    BOOST_REQUIRE(parsed.kind == contains_kind::containment);
+    BOOST_REQUIRE_EQUAL(parse_contains_pattern("%a b%", 1).value().keyword, "a b");
+    BOOST_REQUIRE_EQUAL(parse_contains_pattern("%a%", 1).value().keyword, "a");
+
+    parsed = parse_contains_pattern("abc%", 1).value();
+    BOOST_REQUIRE_EQUAL(parsed.keyword, "abc");
+    BOOST_REQUIRE(parsed.kind == contains_kind::prefix);
+    parsed = parse_contains_pattern("%abc", 1).value();
+    BOOST_REQUIRE_EQUAL(parsed.keyword, "abc");
+    BOOST_REQUIRE(parsed.kind == contains_kind::suffix);
+    // A one-character prefix or suffix is a keyword like any other.
+    BOOST_REQUIRE(parse_contains_pattern("a%", 1).value().kind == contains_kind::prefix);
+    BOOST_REQUIRE(parse_contains_pattern("%a", 1).value().kind == contains_kind::suffix);
 
     // No keyword at all.
     BOOST_REQUIRE(!parse_contains_pattern("", 1));
     BOOST_REQUIRE(!parse_contains_pattern("%", 1));
     BOOST_REQUIRE(!parse_contains_pattern("%%", 1));
-    // A prefix, a suffix or an equality are not containment.
-    BOOST_REQUIRE(!parse_contains_pattern("abc%", 1));
-    BOOST_REQUIRE(!parse_contains_pattern("%abc", 1));
+    // An equality has no wildcard to route on.
     BOOST_REQUIRE(!parse_contains_pattern("abc", 1));
-    // Wildcards and the escape inside the keyword make it non-literal.
+    // Wildcards and the escape inside the keyword make it non-literal, whatever the shape.
     BOOST_REQUIRE(!parse_contains_pattern("%a_c%", 1));
     BOOST_REQUIRE(!parse_contains_pattern("%a%c%", 1));
     BOOST_REQUIRE(!parse_contains_pattern("%a\\%c%", 1));
     BOOST_REQUIRE(!parse_contains_pattern("%a\\c%", 1));
+    BOOST_REQUIRE(!parse_contains_pattern("a_c%", 1));
+    BOOST_REQUIRE(!parse_contains_pattern("%a_c", 1));
+    BOOST_REQUIRE(!parse_contains_pattern("a%c%", 1));
+    BOOST_REQUIRE(!parse_contains_pattern("%a%c", 1));
+    // An escaped trailing or leading '%' is a literal one, so the pattern is an equality.
+    BOOST_REQUIRE(!parse_contains_pattern("abc\\%", 1));
+    BOOST_REQUIRE(!parse_contains_pattern("\\%abc", 1));
 }
 
 BOOST_AUTO_TEST_CASE(parse_contains_pattern_counts_characters_against_min_gram) {
     BOOST_REQUIRE(parse_contains_pattern("%ab%", 2));
     BOOST_REQUIRE(!parse_contains_pattern("%ab%", 3));
+    // The keyword's own characters count, whichever side the wildcard is on.
+    BOOST_REQUIRE(parse_contains_pattern("ab%", 2));
+    BOOST_REQUIRE(!parse_contains_pattern("ab%", 3));
+    BOOST_REQUIRE(parse_contains_pattern("%ab", 2));
+    BOOST_REQUIRE(!parse_contains_pattern("%ab", 3));
+    BOOST_REQUIRE(!parse_contains_pattern("a%", 2));
     // Three characters in nine bytes.
-    BOOST_REQUIRE_EQUAL(parse_contains_pattern("%\u5b87\u5c06\u519b%", 3).value(), "\u5b87\u5c06\u519b");
+    BOOST_REQUIRE_EQUAL(parse_contains_pattern("%\u5b87\u5c06\u519b%", 3).value().keyword, "\u5b87\u5c06\u519b");
     BOOST_REQUIRE(!parse_contains_pattern("%\u5b87\u5c06%", 3));
     // A four-byte code point is one character.
     BOOST_REQUIRE(parse_contains_pattern("%\U0001F600%", 1));

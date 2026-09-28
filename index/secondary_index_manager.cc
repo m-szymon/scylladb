@@ -93,9 +93,9 @@ index::supports_expression_v index::supports_like_expression(const column_defini
         if (pattern->is_null()) {
             return supports_expression_v::from_bool(false);
         }
-        const auto keyword = cql3::statements::external_search::parse_contains_pattern(
+        const auto parsed = cql3::statements::external_search::parse_contains_pattern(
                 pattern->view().deserialize<sstring>(*pattern->type), substring_index::min_gram(_im));
-        return supports_expression_v::from_bool(keyword.has_value());
+        return supports_expression_v::from_bool(parsed.has_value());
     }
     // A pattern known only at execution: routed, and rejected then if it turns out not to be one the index serves.
     return supports_expression_v::from_bool(true);

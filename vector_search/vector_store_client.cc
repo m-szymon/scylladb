@@ -47,6 +47,8 @@ using duration = lowres_clock::duration;
 using vs_vector = vector_search::vector_store_client::vs_vector;
 using query_string = vector_search::vector_store_client::query_string;
 using limit = vector_search::vector_store_client::limit;
+using contains_order = vector_search::vector_store_client::contains_order;
+using contains_kind = vector_search::vector_store_client::contains_kind;
 using host_name = vector_search::vector_store_client::host_name;
 using http_path = sstring;
 using inet_address = seastar::net::inet_address;
@@ -230,13 +232,27 @@ auto read_bm25_json(rjson::value const& json, schema_ptr const& schema) -> std::
     return read_scored_primary_keys_json(json, schema, "scores");
 }
 
-auto write_contains_json(query_string keyword, limit limit, std::optional<uint64_t> cursor,
-        std::optional<uint64_t> min_sort_key, std::optional<uint64_t> max_sort_key) -> json_content {
+auto write_contains_json(query_string keyword, contains_kind kind, limit limit, std::optional<sstring> const& cursor,
+        std::optional<contains_order> order, std::optional<uint64_t> min_sort_key, std::optional<uint64_t> max_sort_key) -> json_content {
     auto body = rjson::empty_object();
     rjson::add(body, "query", rjson::from_string(keyword));
+    // Containment is the index node's default, so only the other two kinds are spelled out.
+    switch (kind) {
+    case contains_kind::containment:
+        break;
+    case contains_kind::prefix:
+        rjson::add(body, "kind", rjson::from_string("prefix"));
+        break;
+    case contains_kind::suffix:
+        rjson::add(body, "kind", rjson::from_string("suffix"));
+        break;
+    }
     rjson::add(body, "limit", static_cast<uint64_t>(limit));
     if (cursor) {
-        rjson::add(body, "cursor", *cursor);
+        rjson::add(body, "cursor", rjson::from_string(*cursor));
+    }
+    if (order) {
+        rjson::add(body, "order", rjson::from_string(*order == contains_order::ascending ? "asc" : "desc"));
     }
     if (min_sort_key) {
         rjson::add(body, "min_sort_key", *min_sort_key);
@@ -248,17 +264,18 @@ auto write_contains_json(query_string keyword, limit limit, std::optional<uint64
 }
 
 /// The cursor a page reports, if any. Absent is normal -- an unordered index never reports one --
-/// so only a present-but-wrong value is an error.
-auto read_next_cursor_json(rjson::value const& json) -> std::expected<std::optional<uint64_t>, ann_error> {
+/// so only a present-but-wrong value is an error. The string is kept as it came: it is the index
+/// node's to interpret.
+auto read_next_cursor_json(rjson::value const& json) -> std::expected<std::optional<sstring>, ann_error> {
     auto const* cursor_json = rjson::find(json, "next_cursor");
     if (cursor_json == nullptr || cursor_json->IsNull()) {
-        return std::optional<uint64_t>{};
+        return std::optional<sstring>{};
     }
-    if (!cursor_json->IsUint64()) {
-        vslogger.error("Vector Store returned invalid JSON: 'next_cursor' is not an unsigned integer");
+    if (!cursor_json->IsString()) {
+        vslogger.error("Vector Store returned invalid JSON: 'next_cursor' is not a string");
         return std::unexpected{service_reply_format_error{}};
     }
-    return std::optional<uint64_t>{cursor_json->GetUint64()};
+    return std::optional<sstring>{sstring(cursor_json->GetString(), cursor_json->GetStringLength())};
 }
 
 /// Reads a reply carrying primary keys and nothing to rank them by, so the number of results is
@@ -554,10 +571,11 @@ struct vector_store_client::impl {
         }
     }
 
-    auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit, std::optional<uint64_t> cursor,
-            std::optional<uint64_t> min_sort_key, std::optional<uint64_t> max_sort_key, abort_source& as) -> future<std::expected<contains_page, contains_error>> {
+    auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, contains_kind kind, limit limit,
+            std::optional<sstring> cursor, std::optional<vector_store_client::contains_order> order, std::optional<uint64_t> min_sort_key,
+            std::optional<uint64_t> max_sort_key, abort_source& as) -> future<std::expected<contains_page, contains_error>> {
         auto content = co_await post_to_index("contains", format("/api/v1/indexes/{}/{}/contains", keyspace, name),
-                write_contains_json(std::move(keyword), limit, cursor, min_sort_key, max_sort_key), as);
+                write_contains_json(std::move(keyword), kind, limit, cursor, order, min_sort_key, max_sort_key), as);
         if (!content) {
             co_return std::unexpected{content.error()};
         }
@@ -572,7 +590,7 @@ struct vector_store_client::impl {
             if (!next_cursor) {
                 co_return std::unexpected{next_cursor.error()};
             }
-            co_return contains_page{std::move(*keys), *next_cursor};
+            co_return contains_page{std::move(*keys), std::move(*next_cursor)};
         } catch (const rjson::error& e) {
             vslogger.error("Vector Store returned invalid JSON: {}", e.what());
             co_return std::unexpected{service_reply_format_error{}};
@@ -656,9 +674,10 @@ auto vector_store_client::bm25(keyspace_name keyspace, index_name name, schema_p
     return _impl->bm25(std::move(keyspace), std::move(name), schema, std::move(fts_query), limit, as);
 }
 
-auto vector_store_client::contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, limit limit, std::optional<uint64_t> cursor,
-        std::optional<uint64_t> min_sort_key, std::optional<uint64_t> max_sort_key, abort_source& as) -> future<std::expected<contains_page, contains_error>> {
-    return _impl->contains(std::move(keyspace), std::move(name), schema, std::move(keyword), limit, cursor, min_sort_key, max_sort_key, as);
+auto vector_store_client::contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, contains_kind kind, limit limit,
+        std::optional<sstring> cursor, std::optional<contains_order> order, std::optional<uint64_t> min_sort_key, std::optional<uint64_t> max_sort_key,
+        abort_source& as) -> future<std::expected<contains_page, contains_error>> {
+    return _impl->contains(std::move(keyspace), std::move(name), schema, std::move(keyword), kind, limit, std::move(cursor), order, min_sort_key, max_sort_key, as);
 }
 
 auto vector_store_client::highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents documents, abort_source& as)

@@ -255,19 +255,21 @@ def substring_table(cql, test_keyspace):
     cql.execute(f"DROP TABLE {table}")
 
 
-def test_like_contains_prepares_without_allow_filtering(cql, substring_table):
-    """A '%keyword%' LIKE on the indexed column is served by the index, so no ALLOW FILTERING is needed."""
-    cql.prepare(f"SELECT * FROM {substring_table} WHERE nickname LIKE '%ell%' LIMIT 10")
+@pytest.mark.parametrize("pattern", ["%ell%", "ell%", "%ell"])
+def test_like_contains_prepares_without_allow_filtering(cql, substring_table, pattern):
+    """A '%keyword%', 'keyword%' or '%keyword' LIKE on the indexed column is served by the index, so no ALLOW FILTERING is needed."""
+    cql.prepare(f"SELECT * FROM {substring_table} WHERE nickname LIKE '{pattern}' LIMIT 10")
     cql.prepare(f"SELECT * FROM {substring_table} WHERE nickname LIKE ? LIMIT 10")
 
 
-def test_like_contains_requires_limit(cql, substring_table):
-    """A routed LIKE without LIMIT must be rejected."""
+@pytest.mark.parametrize("pattern", ["%ell%", "ell%", "%ell"])
+def test_like_contains_requires_limit(cql, substring_table, pattern):
+    """A routed LIKE without LIMIT must be rejected, whichever shape it has."""
     with pytest.raises(InvalidRequest, match="require a LIMIT"):
-        cql.execute(f"SELECT * FROM {substring_table} WHERE nickname LIKE '%ell%'")
+        cql.execute(f"SELECT * FROM {substring_table} WHERE nickname LIKE '{pattern}'")
 
 
-@pytest.mark.parametrize("pattern", ["ell%", "%ell", "%e_l%", "%e%l%", "%e\\\\%l%", "%e%", "ell", "%%"])
+@pytest.mark.parametrize("pattern", ["%e_l%", "%e%l%", "%e\\\\%l%", "%e%", "e%", "%e", "ell", "%%", "%", "e_l%", "%e_l", "e%l%", "%e%l", "ell\\\\%", "\\\\%ell"])
 def test_like_unsupported_pattern_keeps_filtering_semantics(cql, substring_table, pattern):
     """A literal pattern the index does not serve behaves exactly as without the index: ALLOW FILTERING is required, and works."""
     with pytest.raises(InvalidRequest, match="ALLOW FILTERING"):

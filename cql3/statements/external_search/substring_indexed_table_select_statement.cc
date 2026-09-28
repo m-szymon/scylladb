@@ -101,17 +101,18 @@ substring_restrictions find_like_restriction(const restrictions::select_restrict
     return substring_restrictions{*binop, std::move(sort_bounds)};
 }
 
-/// Checks an ORDER BY against the column the index was created to order by.
+/// Checks an ORDER BY against the column the index was created to order by, and returns the
+/// direction it asked for -- empty when the query has none.
 ///
 /// The coordinator's own ordering checks are skipped for a substring query (see the guard in
 /// select_statement.cc), so this is the only thing standing between a user and a query that claims
 /// an order the index cannot provide. An index with no sort column can serve no ORDER BY at all:
 /// its results come back in whatever order the walk found them.
-void validate_ordering(const schema& schema, const select_statement::parameters& parameters,
-        const secondary_index::index& index) {
+std::optional<vector_search::vector_store_client::contains_order> validate_ordering(const schema& schema,
+        const select_statement::parameters& parameters, const secondary_index::index& index) {
     const auto& orderings = parameters.orderings();
     if (orderings.empty()) {
-        return;
+        return std::nullopt;
     }
     if (orderings.size() != 1) {
         throw exceptions::invalid_request_exception("Substring search queries support ordering by a single column");
@@ -131,13 +132,15 @@ void validate_ordering(const schema& schema, const select_statement::parameters&
                 "Substring search queries can only be ordered by {}, the column the index was created with, not {}",
                 *order_by, column->to_string()));
     }
-    // The index node walks its sort column from the highest value down, so ascending order would
-    // need it to walk the other way. Nothing here is inherently descending, but nothing takes a
-    // direction either; rejecting is better than quietly answering in the wrong one.
-    if (!std::holds_alternative<raw::select_statement::ordering>(ordering)
-            || std::get<raw::select_statement::ordering>(ordering) != raw::select_statement::ordering::descending) {
-        throw exceptions::invalid_request_exception("Substring search queries can only be ordered DESC");
+    // The index node walks its sort column either way; the direction is passed to it and the rows
+    // come back in that order, so nothing here re-sorts them.
+    const auto* direction = std::get_if<raw::select_statement::ordering>(&ordering);
+    if (!direction) {
+        throw exceptions::invalid_request_exception("Substring search queries can only be ordered ASC or DESC");
     }
+    return *direction == raw::select_statement::ordering::ascending
+            ? vector_search::vector_store_client::contains_order::ascending
+            : vector_search::vector_store_client::contains_order::descending;
 }
 
 } // anonymous namespace
@@ -167,14 +170,14 @@ void validate_ordering(const schema& schema, const select_statement::parameters&
         throw exceptions::invalid_request_exception("Substring search queries cannot be combined with scoring functions");
     }
 
-    validate_ordering(*schema, *parameters, index);
+    auto order = validate_ordering(*schema, *parameters, index);
 
     auto found = find_like_restriction(*restrictions, index);
     const auto& like = found.like;
     const auto* target_column = expr::as<expr::column_value>(like.lhs).col;
     const unsigned min_gram = secondary_index::substring_index::min_gram(index.metadata());
 
-    std::optional<sstring> keyword;
+    std::optional<external_search::contains_pattern> literal;
     std::optional<expr::expression> deferred_pattern;
     if (const auto* pattern = expr::as_if<expr::constant>(&like.rhs)) {
         if (pattern->is_null()) {
@@ -187,7 +190,7 @@ void validate_ordering(const schema& schema, const select_statement::parameters&
             on_internal_error(sslogger,
                     seastar::format("substring index chosen for a LIKE pattern it cannot answer: {}", parsed.error().message));
         }
-        keyword = std::move(*parsed);
+        literal = std::move(*parsed);
     } else {
         deferred_pattern = like.rhs;
     }
@@ -207,9 +210,10 @@ void validate_ordering(const schema& schema, const select_statement::parameters&
             index,
             target_column,
             min_gram,
-            std::move(keyword),
+            std::move(literal),
             std::move(deferred_pattern),
             std::move(found.sort_bounds),
+            order,
             std::move(attrs));
 }
 
@@ -220,17 +224,19 @@ substring_indexed_table_select_statement::substring_indexed_table_select_stateme
         ordering_comparator_type ordering_comparator, std::optional<expr::expression> limit,
         std::optional<expr::expression> per_partition_limit, cql_stats& stats,
         const secondary_index::index& index, const column_definition* target_column, unsigned min_gram,
-        std::optional<sstring> keyword, std::optional<expr::expression> deferred_pattern,
-        std::vector<expr::binary_operator> sort_bounds, std::unique_ptr<attributes> attrs)
+        std::optional<external_search::contains_pattern> pattern, std::optional<expr::expression> deferred_pattern,
+        std::vector<expr::binary_operator> sort_bounds, std::optional<vector_search::vector_store_client::contains_order> order,
+        std::unique_ptr<attributes> attrs)
     : external_index_select_statement{schema, bound_terms, parameters, selection, restrictions,
               group_by_cell_indices, is_reversed, ordering_comparator, limit, per_partition_limit,
               stats, index, std::move(attrs)}
     , _target_column{target_column}
     , _min_gram{min_gram}
-    , _keyword{std::move(keyword)}
+    , _pattern{std::move(pattern)}
     , _deferred_pattern{std::move(deferred_pattern)}
     , _sort_bounds{std::move(sort_bounds)}
-    , _ordered{secondary_index::substring_index::order_by(index.metadata()).has_value()} {
+    , _ordered{secondary_index::substring_index::order_by(index.metadata()).has_value()}
+    , _order{order} {
 }
 
 std::pair<std::optional<uint64_t>, std::optional<uint64_t>>
@@ -271,7 +277,7 @@ substring_indexed_table_select_statement::evaluate_sort_bounds(const query_optio
     return {min, max};
 }
 
-std::pair<std::optional<uint64_t>, uint64_t>
+std::pair<std::optional<sstring>, uint64_t>
 substring_indexed_table_select_statement::resume_point(const query_options& options, uint64_t limit) const {
     auto state = options.get_paging_state();
     if (!_ordered || !state) {
@@ -306,9 +312,9 @@ lw_shared_ptr<const service::pager::paging_state> substring_indexed_table_select
             std::nullopt, *page.next_cursor);
 }
 
-sstring substring_indexed_table_select_statement::evaluate_keyword(const query_options& options) const {
-    if (_keyword) {
-        return *_keyword;
+external_search::contains_pattern substring_indexed_table_select_statement::evaluate_pattern(const query_options& options) const {
+    if (_pattern) {
+        return *_pattern;
     }
     auto pattern = expr::evaluate(*_deferred_pattern, options);
     if (pattern.is_null()) {
@@ -336,19 +342,20 @@ future<shared_ptr<cql_transport::messages::result_message>> substring_indexed_ta
 
     // Throws invalid_request_exception for a bound pattern the index does not serve; a throw in a
     // coroutine body becomes the exceptional future the caller expects.
-    const auto keyword = evaluate_keyword(options);
+    const auto pattern = evaluate_pattern(options);
 
     // Throws for a bound the index cannot range over, or a null one.
     auto [min_sort_key, max_sort_key] = evaluate_sort_bounds(options);
 
-    // An ordered index walks its matches downwards and reports where it stopped, so a page can pick
-    // up from there. Without one there is no defined position to resume from, and the query keeps
-    // the stage-1 shape: one page holding the whole result, with the warning do_execute adds.
+    // An ordered index walks its matches in the direction asked for and reports where it stopped,
+    // so a page can pick up from there. Without one there is no defined position to resume from,
+    // and the query keeps the stage-1 shape: one page holding the whole result, with the warning
+    // do_execute adds.
     auto [cursor, remaining] = resume_point(options, limit);
     auto page_limit = page_size_for(options, remaining);
 
     auto page = co_await qp.vector_store_client().contains(_schema->ks_name(), _index.metadata().name(), _schema,
-            std::string(keyword), page_limit, cursor, min_sort_key, max_sort_key, aoe.abort_source());
+            std::string(pattern.keyword), pattern.kind, page_limit, std::move(cursor), _order, min_sort_key, max_sort_key, aoe.abort_source());
     if (!page.has_value()) {
         co_await coroutine::return_exception(
                 exceptions::invalid_request_exception(std::visit(vector_search::vector_store_client::contains_error_visitor{}, page.error())));
@@ -357,8 +364,8 @@ future<shared_ptr<cql_transport::messages::result_message>> substring_indexed_ta
     throwing_assert(page->keys.size() <= page_limit);
 
     // The index node returns the keys in the order it wants them read -- its own for an unordered
-    // index, newest-first for one with a sort column -- and query_base_table preserves that order
-    // on both of its paths, so no score provider and no re-sorting are needed here.
+    // index, the ORDER BY's direction for one with a sort column -- and query_base_table preserves
+    // that order on both of its paths, so no score provider and no re-sorting are needed here.
     co_return co_await query_base_table(
             qp, state, options, page->keys, timeout, nullptr, next_page_state(*page, remaining));
 }

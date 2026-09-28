@@ -68,8 +68,8 @@ entry for that value. If the index must reflect expiration, use the
 Querying with LIKE
 ------------------
 
-A ``LIKE`` whose pattern is exactly ``'%keyword%'`` on an indexed column is
-answered by the index::
+A ``LIKE`` whose pattern is exactly ``'%keyword%'``, ``'keyword%'`` or
+``'%keyword'`` on an indexed column is answered by the index::
 
     SELECT user_id, nickname FROM ks.users
         WHERE nickname LIKE '%将军%'
@@ -99,8 +99,9 @@ newly written or changed name becomes searchable within a few seconds.
 Limitations
 -----------
 
-* Only the ``'%keyword%'`` pattern is served. Prefix, suffix and wildcard
-  patterns still need ``ALLOW FILTERING``.
+* Only the ``'%keyword%'``, ``'keyword%'`` and ``'%keyword'`` patterns are
+  served. Any other pattern -- a wildcard or an escape inside the keyword, a
+  lone ``%`` -- still needs ``ALLOW FILTERING``.
 * The keyword must be at least ``min_gram`` characters long.
 * ``LIMIT`` is required and capped at 1000; results are not ordered and not
   paged.

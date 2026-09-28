@@ -40,10 +40,12 @@ restrictions", a `LIKE` is an ordinary column restriction. It is routed through 
   statement. `check_needs_filtering` and the filtering-column retrieval are skipped, as for BM25
   and ANN, because no post-filtering happens.
 
-The consequence that matters: a `LIKE` the index does not serve (a prefix, a wildcard inside the
-keyword, a keyword shorter than `min_gram`, a column without a substring index) makes
+The consequence that matters: a `LIKE` the index does not serve (a wildcard or an escape inside
+the keyword, a keyword shorter than `min_gram`, a column without a substring index) makes
 `supports_like_expression` answer no, so nothing changes for it: it still requires
-`ALLOW FILTERING` and scans the table. Only the `%keyword%` shape is ever routed.
+`ALLOW FILTERING` and scans the table. Only the `%keyword%`, `keyword%` and `%keyword` shapes are
+ever routed; the request tells the index node which one it got with `"kind": "prefix"` or
+`"kind": "suffix"` (containment, the node's default, sends none).
 
 `parse_contains_pattern()` (`cql3/statements/external_search/substring_pattern.cc`) is the single
 definition of that shape. It counts the keyword in UTF-8 code points, so `min_gram` means

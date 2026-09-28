@@ -6,9 +6,10 @@
 # Tests for substring search query execution.
 #
 # These tests use the shared Vector Store mock from vector_store_mock.py to
-# verify that Scylla translates a `LIKE '%keyword%'` on a substring-indexed
-# column into an HTTP POST to the `/contains` endpoint of the Vector Store
-# service, and reads the returned rows from the base table.
+# verify that Scylla translates a `LIKE '%keyword%'` (or `'keyword%'`, or
+# `'%keyword'`) on a substring-indexed column into an HTTP POST to the
+# `/contains` endpoint of the Vector Store service, and reads the returned rows
+# from the base table.
 ###############################################################################
 
 import json
@@ -86,7 +87,7 @@ def test_like_contains_bind_marker_executes(cql, vector_store_mock, substring_se
     assert body["query"] == "ell"
 
 
-@pytest.mark.parametrize("pattern", ["ell%", "%ell", "%e_l%", "%e%l%", "%e", "%%"])
+@pytest.mark.parametrize("pattern", ["%e_l%", "%e%l%", "%e", "e%", "%%", "%", "ell", "e_l%", "%e%l", "ell\\%", "\\%ell", "%e\\%l%"])
 def test_like_contains_bind_marker_with_unsupported_pattern_fails_at_execution(cql, vector_store_mock, substring_setup_with_mock, pattern):
     """The index was chosen at prepare, so a bound pattern it cannot serve is an error rather than a scan."""
     table, _ = substring_setup_with_mock
@@ -95,6 +96,53 @@ def test_like_contains_bind_marker_with_unsupported_pattern_fails_at_execution(c
     with pytest.raises(InvalidRequest, match="substring index"):
         cql.execute(stmt, [pattern])
     assert vector_store_mock.contains_requests == []
+
+
+def test_like_contains_sends_no_kind(cql, vector_store_mock, substring_setup_with_mock):
+    """Containment is the index node's default, so a '%keyword%' request names no kind."""
+    table, _ = substring_setup_with_mock
+
+    cql.execute(f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' LIMIT {NUM_ROWS}")
+    req = vector_store_mock.contains_requests[-1]
+    assert req.kind is None
+    assert "kind" not in json.loads(req.body)
+
+
+def test_like_prefix_executes_through_the_index(cql, vector_store_mock, substring_setup_with_mock):
+    """A 'keyword%' LIKE is answered by the index too, and the request says it is a prefix."""
+    table, _ = substring_setup_with_mock
+
+    rows = list(cql.execute(f"SELECT id FROM {table} WHERE nickname LIKE 'hel%' LIMIT {NUM_ROWS}"))
+    assert sorted(r.id for r in rows) == [1, 3]
+    req = vector_store_mock.contains_requests[-1]
+    assert req.kind == "prefix"
+    body = json.loads(req.body)
+    assert body["query"] == "hel"
+    assert body["kind"] == "prefix"
+
+
+def test_like_suffix_executes_through_the_index(cql, vector_store_mock, substring_setup_with_mock):
+    """A '%keyword' LIKE is answered by the index too, and the request says it is a suffix."""
+    table, _ = substring_setup_with_mock
+
+    rows = list(cql.execute(f"SELECT id FROM {table} WHERE nickname LIKE '%llo' LIMIT {NUM_ROWS}"))
+    assert sorted(r.id for r in rows) == [1, 3]
+    req = vector_store_mock.contains_requests[-1]
+    assert req.kind == "suffix"
+    body = json.loads(req.body)
+    assert body["query"] == "llo"
+    assert body["kind"] == "suffix"
+
+
+@pytest.mark.parametrize("pattern,kind", [("hel%", "prefix"), ("%llo", "suffix"), ("%ell%", None)])
+def test_like_bind_marker_kind_follows_the_bound_pattern(cql, vector_store_mock, substring_setup_with_mock, pattern, kind):
+    """A bound pattern's kind is read at execution, like its keyword."""
+    table, _ = substring_setup_with_mock
+
+    stmt = cql.prepare(f"SELECT id FROM {table} WHERE nickname LIKE ? LIMIT {NUM_ROWS}")
+    rows = list(cql.execute(stmt, [pattern]))
+    assert sorted(r.id for r in rows) == [1, 3]
+    assert vector_store_mock.contains_requests[-1].kind == kind
 
 
 def test_like_contains_bind_marker_null_fails(cql, substring_setup_with_mock):
