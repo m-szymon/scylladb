@@ -232,8 +232,18 @@ auto read_bm25_json(rjson::value const& json, schema_ptr const& schema) -> std::
     return read_scored_primary_keys_json(json, schema, "scores");
 }
 
+using sort_bound = vector_search::vector_store_client::sort_bound;
+
+auto sort_bound_json(sort_bound const& bound) -> rjson::value {
+    auto json = rjson::empty_object();
+    rjson::add(json, "value", rjson::copy(bound.value));
+    rjson::add(json, "inclusive", rjson::value(bound.inclusive));
+    return json;
+}
+
 auto write_contains_json(query_string keyword, contains_kind kind, limit limit, std::optional<sstring> const& cursor,
-        std::optional<contains_order> order, std::optional<uint64_t> min_sort_key, std::optional<uint64_t> max_sort_key) -> json_content {
+        std::optional<contains_order> order, std::optional<sort_bound> const& min_sort_value, std::optional<sort_bound> const& max_sort_value)
+        -> json_content {
     auto body = rjson::empty_object();
     rjson::add(body, "query", rjson::from_string(keyword));
     // Containment is the index node's default, so only the other two kinds are spelled out.
@@ -254,11 +264,11 @@ auto write_contains_json(query_string keyword, contains_kind kind, limit limit, 
     if (order) {
         rjson::add(body, "order", rjson::from_string(*order == contains_order::ascending ? "asc" : "desc"));
     }
-    if (min_sort_key) {
-        rjson::add(body, "min_sort_key", *min_sort_key);
+    if (min_sort_value) {
+        rjson::add(body, "min_sort_value", sort_bound_json(*min_sort_value));
     }
-    if (max_sort_key) {
-        rjson::add(body, "max_sort_key", *max_sort_key);
+    if (max_sort_value) {
+        rjson::add(body, "max_sort_value", sort_bound_json(*max_sort_value));
     }
     return rjson::print(body);
 }
@@ -572,10 +582,10 @@ struct vector_store_client::impl {
     }
 
     auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, contains_kind kind, limit limit,
-            std::optional<sstring> cursor, std::optional<vector_store_client::contains_order> order, std::optional<uint64_t> min_sort_key,
-            std::optional<uint64_t> max_sort_key, abort_source& as) -> future<std::expected<contains_page, contains_error>> {
+            std::optional<sstring> cursor, std::optional<vector_store_client::contains_order> order, std::optional<sort_bound> min_sort_value,
+            std::optional<sort_bound> max_sort_value, abort_source& as) -> future<std::expected<contains_page, contains_error>> {
         auto content = co_await post_to_index("contains", format("/api/v1/indexes/{}/{}/contains", keyspace, name),
-                write_contains_json(std::move(keyword), kind, limit, cursor, order, min_sort_key, max_sort_key), as);
+                write_contains_json(std::move(keyword), kind, limit, cursor, order, min_sort_value, max_sort_value), as);
         if (!content) {
             co_return std::unexpected{content.error()};
         }
@@ -675,9 +685,10 @@ auto vector_store_client::bm25(keyspace_name keyspace, index_name name, schema_p
 }
 
 auto vector_store_client::contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, contains_kind kind, limit limit,
-        std::optional<sstring> cursor, std::optional<contains_order> order, std::optional<uint64_t> min_sort_key, std::optional<uint64_t> max_sort_key,
+        std::optional<sstring> cursor, std::optional<contains_order> order, std::optional<sort_bound> min_sort_value, std::optional<sort_bound> max_sort_value,
         abort_source& as) -> future<std::expected<contains_page, contains_error>> {
-    return _impl->contains(std::move(keyspace), std::move(name), schema, std::move(keyword), kind, limit, std::move(cursor), order, min_sort_key, max_sort_key, as);
+    return _impl->contains(std::move(keyspace), std::move(name), schema, std::move(keyword), kind, limit, std::move(cursor), order,
+            std::move(min_sort_value), std::move(max_sort_value), as);
 }
 
 auto vector_store_client::highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents documents, abort_source& as)

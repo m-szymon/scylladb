@@ -8,6 +8,7 @@
 
 #include "cql3/statements/external_search/substring_indexed_table_select_statement.hh"
 #include "cql3/statements/external_search/substring_pattern.hh"
+#include "cql3/statements/external_search/filter.hh"
 #include "cql3/statements/raw/select_statement.hh"
 #include "cql3/expr/evaluate.hh"
 #include "cql3/expr/expression.hh"
@@ -239,42 +240,48 @@ substring_indexed_table_select_statement::substring_indexed_table_select_stateme
     , _order{order} {
 }
 
-std::pair<std::optional<uint64_t>, std::optional<uint64_t>>
+std::pair<std::optional<substring_indexed_table_select_statement::sort_bound>, std::optional<substring_indexed_table_select_statement::sort_bound>>
 substring_indexed_table_select_statement::evaluate_sort_bounds(const query_options& options) const {
-    std::optional<uint64_t> min;
-    std::optional<uint64_t> max;
+    // A bound as evaluated, before it is encoded: the value's bytes, so that two bounds on the
+    // same side can be compared with the column's own comparator, and whether it includes them.
+    struct raw_bound {
+        cql3::raw_value value;
+        bool inclusive;
+    };
+    std::optional<raw_bound> min;
+    std::optional<raw_bound> max;
+    const column_definition* column = nullptr;
     for (const auto& bound : _sort_bounds) {
         auto value = expr::evaluate(bound.rhs, options);
         if (value.is_null()) {
             throw exceptions::invalid_request_exception("A range bound of a substring search query must not be null");
         }
-        const auto* column = expr::as<expr::column_value>(bound.lhs).col;
-        auto bytes = to_bytes(value.view());
-        auto key = secondary_index::to_sort_key(*column->type, bytes);
-        if (!key) {
-            throw exceptions::invalid_request_exception(seastar::format(
-                    "Substring search queries cannot range over column {} of type {}", column->name_as_text(), column->type->name()));
-        }
-        // An exclusive bound is narrowed to the inclusive one next to it, because the index node's
-        // range bounds are inclusive. Sort keys are integers, so the neighbour is exact.
-        switch (bound.op) {
-        case expr::oper_t::GT:
-            min = std::max(min.value_or(0), *key == std::numeric_limits<uint64_t>::max() ? *key : *key + 1);
-            break;
-        case expr::oper_t::GTE:
-            min = std::max(min.value_or(0), *key);
-            break;
-        case expr::oper_t::LT:
-            max = std::min(max.value_or(std::numeric_limits<uint64_t>::max()), *key == 0 ? *key : *key - 1);
-            break;
-        case expr::oper_t::LTE:
-            max = std::min(max.value_or(std::numeric_limits<uint64_t>::max()), *key);
-            break;
-        default:
+        column = expr::as<expr::column_value>(bound.lhs).col;
+        const bool inclusive = bound.op == expr::oper_t::GTE || bound.op == expr::oper_t::LTE;
+        const bool lower = bound.op == expr::oper_t::GT || bound.op == expr::oper_t::GTE;
+        if (!lower && bound.op != expr::oper_t::LT && bound.op != expr::oper_t::LTE) {
             on_internal_error(sslogger, "a non-slice bound reached evaluate_sort_bounds");
         }
+        // Of two bounds on one side the tighter wins: the larger lower bound, the smaller upper
+        // one, and at an equal value the exclusive one.
+        auto& side = lower ? min : max;
+        if (!side) {
+            side = raw_bound{std::move(value), inclusive};
+            continue;
+        }
+        auto order = column->type->compare(to_bytes(value.view()), to_bytes(side->value.view()));
+        const bool tighter = lower ? order > 0 : order < 0;
+        if (tighter || (order == 0 && !inclusive)) {
+            side = raw_bound{std::move(value), inclusive};
+        }
     }
-    return {min, max};
+    auto encode = [&](std::optional<raw_bound>& bound) -> std::optional<sort_bound> {
+        if (!bound) {
+            return std::nullopt;
+        }
+        return sort_bound{external_search::value_to_json(column->type, bound->value), bound->inclusive};
+    };
+    return {encode(min), encode(max)};
 }
 
 std::pair<std::optional<sstring>, uint64_t>
@@ -344,8 +351,8 @@ future<shared_ptr<cql_transport::messages::result_message>> substring_indexed_ta
     // coroutine body becomes the exceptional future the caller expects.
     const auto pattern = evaluate_pattern(options);
 
-    // Throws for a bound the index cannot range over, or a null one.
-    auto [min_sort_key, max_sort_key] = evaluate_sort_bounds(options);
+    // Throws for a null bound. The values go to the index node as they are; it encodes them.
+    auto [min_sort_value, max_sort_value] = evaluate_sort_bounds(options);
 
     // An ordered index walks its matches in the direction asked for and reports where it stopped,
     // so a page can pick up from there. Without one there is no defined position to resume from,
@@ -355,7 +362,8 @@ future<shared_ptr<cql_transport::messages::result_message>> substring_indexed_ta
     auto page_limit = page_size_for(options, remaining);
 
     auto page = co_await qp.vector_store_client().contains(_schema->ks_name(), _index.metadata().name(), _schema,
-            std::string(pattern.keyword), pattern.kind, page_limit, std::move(cursor), _order, min_sort_key, max_sort_key, aoe.abort_source());
+            std::string(pattern.keyword), pattern.kind, page_limit, std::move(cursor), _order, std::move(min_sort_value), std::move(max_sort_value),
+            aoe.abort_source());
     if (!page.has_value()) {
         co_await coroutine::return_exception(
                 exceptions::invalid_request_exception(std::visit(vector_search::vector_store_client::contains_error_visitor{}, page.error())));

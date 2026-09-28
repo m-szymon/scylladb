@@ -64,33 +64,6 @@ unsigned gram_option(const index_options_map& options, const sstring& name, unsi
 
 } // anonymous namespace
 
-std::optional<uint64_t> to_sort_key(const abstract_type& type, bytes_view value) {
-    auto biased = [](int64_t v) { return static_cast<uint64_t>(v) ^ (uint64_t{1} << 63); };
-    switch (type.get_kind()) {
-    case abstract_type::kind::byte:
-        return biased(value_cast<int8_t>(byte_type->deserialize(value)));
-    case abstract_type::kind::short_kind:
-        return biased(value_cast<int16_t>(short_type->deserialize(value)));
-    case abstract_type::kind::int32:
-        return biased(value_cast<int32_t>(int32_type->deserialize(value)));
-    case abstract_type::kind::long_kind:
-        return biased(value_cast<int64_t>(long_type->deserialize(value)));
-    case abstract_type::kind::counter:
-        return biased(value_cast<int64_t>(counter_type->deserialize(value)));
-    case abstract_type::kind::timestamp:
-        // Milliseconds since the epoch, signed.
-        return biased(value_cast<db_clock::time_point>(timestamp_type->deserialize(value)).time_since_epoch().count());
-    case abstract_type::kind::time:
-        return biased(value_cast<int64_t>(time_type->deserialize(value)));
-    case abstract_type::kind::date:
-    case abstract_type::kind::simple_date:
-        // Already an unsigned day count centred on the epoch, so no bias.
-        return static_cast<uint64_t>(value_cast<uint32_t>(simple_date_type->deserialize(value)));
-    default:
-        return std::nullopt;
-    }
-}
-
 std::optional<cql3::description> substring_index::describe(const index_metadata& im, const schema& base_schema) const {
     auto target = im.options().at(cql3::statements::index_target::target_option_name);
     auto target_column = cql3::statements::index_target::column_name_from_target_string(target);
@@ -188,9 +161,10 @@ void substring_index::check_order_by_column(
         throw exceptions::invalid_request_exception(
                 format("Substring index orders by column {}, which is not in the table", name));
     }
-    // The sort value is carried as a fixed-width integer, so only the types with an
-    // order-preserving image in one can be ordered by. The index node applies the same rule; the
-    // two must agree or an index would be accepted here and refused there.
+    // The index node keeps the sort value as a fixed-width integer, so only the types with an
+    // order-preserving image in one can be ordered by. This is the node's rule (`is_orderable` in
+    // its cql_types.rs) repeated so that a bad index is refused at CREATE rather than later; a
+    // disagreement refuses an index, it cannot misorder one.
     switch (c_def->type->get_kind()) {
     case abstract_type::kind::byte:
     case abstract_type::kind::short_kind:

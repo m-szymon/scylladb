@@ -168,7 +168,44 @@ def test_a_query_without_order_by_names_no_direction(cql, ordered_table, vector_
     assert len(requests) == 1
     assert requests[0].order is None
     assert "order" not in json.loads(requests[0].body)
-    assert "max_sort_key" in json.loads(requests[0].body)
+    assert "max_sort_value" in json.loads(requests[0].body)
+
+
+def test_a_range_travels_as_the_columns_own_values(cql, ordered_table, vector_store_mock):
+    """A bound is sent as a value of the ordered column, in the JSON encoding of its type, with
+    whether it is inclusive; the index node turns it into its sort key. ScyllaDB holds no copy of
+    that encoding, so there is nothing here that could disagree with the node."""
+    table, _ = ordered_table
+    vector_store_mock.reset()
+    vector_store_mock.set_next_contains_response(200, contains_response([3]))
+
+    list(cql.execute(
+        f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' AND registered_at >= 1002 AND registered_at < 1005 "
+        f"ORDER BY registered_at DESC LIMIT {NUM_ROWS}"))
+
+    body = json.loads(vector_store_mock.contains_requests[0].body)
+    assert "min_sort_key" not in body and "max_sort_key" not in body
+    # registered_at is a timestamp: 1002 ms after the epoch, as the type's JSON spells it.
+    assert body["min_sort_value"]["inclusive"] is True
+    assert body["min_sort_value"]["value"].startswith("1970-01-01") and "00:00:01.002" in body["min_sort_value"]["value"]
+    assert body["max_sort_value"]["inclusive"] is False
+    assert "00:00:01.005" in body["max_sort_value"]["value"]
+
+
+def test_two_bounds_on_one_side_collapse_to_the_tighter(cql, ordered_table, vector_store_mock):
+    """`< 1005 AND < 1003` is `< 1003`; the node gets one bound a side."""
+    table, _ = ordered_table
+    vector_store_mock.reset()
+    vector_store_mock.set_next_contains_response(200, contains_response([2]))
+
+    list(cql.execute(
+        f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' AND registered_at < 1005 AND registered_at <= 1003 "
+        f"ORDER BY registered_at DESC LIMIT {NUM_ROWS}"))
+
+    body = json.loads(vector_store_mock.contains_requests[0].body)
+    assert "min_sort_value" not in body
+    assert "00:00:01.003" in body["max_sort_value"]["value"]
+    assert body["max_sort_value"]["inclusive"] is True
 
 
 def test_order_by_a_different_column_is_rejected(cql, ordered_table):
@@ -349,8 +386,8 @@ def test_a_range_is_repeated_on_every_page(cql, ordered_table, vector_store_mock
 
     bodies = [json.loads(request.body) for request in vector_store_mock.contains_requests]
     assert len(bodies) == 2
-    assert all("max_sort_key" in body for body in bodies)
-    assert bodies[0]["max_sort_key"] == bodies[1]["max_sort_key"]
+    assert all("max_sort_value" in body for body in bodies)
+    assert bodies[0]["max_sort_value"] == bodies[1]["max_sort_value"]
 
 
 def test_an_unordered_index_does_not_page(cql, unordered_table, vector_store_mock):

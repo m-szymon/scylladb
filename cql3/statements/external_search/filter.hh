@@ -54,6 +54,10 @@ public:
     rjson::value to_json(const query_options& options) const;
 };
 
+/// A CQL value as the Vector Store service reads it: the JSON encoding of `type`, the one the
+/// filtering API and the substring index's typed sort bounds share.
+rjson::value value_to_json(const data_type& type, const cql3::raw_value& val);
+
 /// Prepares a filter from CQL statement restrictions for use in Vector Store service.
 /// This function extracts restrictions from the statement_restrictions
 /// and prepares them for serialization to JSON compatible to Vector Store service filtering API.

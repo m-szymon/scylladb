@@ -83,6 +83,14 @@ public:
         prefix,
         suffix,
     };
+    /// One end of a range on an ordered index's sort column: the bounding value in the JSON
+    /// encoding of the column's type (the one the filtering API uses), and whether the bound
+    /// includes it. The index node turns it into its own sort key, so nothing here knows how the
+    /// node orders.
+    struct sort_bound {
+        rjson::value value;
+        bool inclusive;
+    };
     using schema_ptr = lw_shared_ptr<schema const>;
     using status_type = http::reply::status_type;
 
@@ -153,8 +161,8 @@ public:
     /// unordered index ignores both and reports no cursor, which is why the ability to order is a
     /// property of the index rather than of the request.
     auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, contains_kind kind, limit limit,
-            std::optional<sstring> cursor, std::optional<contains_order> order, std::optional<uint64_t> min_sort_key, std::optional<uint64_t> max_sort_key,
-            abort_source& as) -> future<std::expected<contains_page, contains_error>>;
+            std::optional<sstring> cursor, std::optional<contains_order> order, std::optional<sort_bound> min_sort_value,
+            std::optional<sort_bound> max_sort_value, abort_source& as) -> future<std::expected<contains_page, contains_error>>;
 
     /// Request a fragment of each of the given documents, with the terms of `fts_query` marked.
     ///

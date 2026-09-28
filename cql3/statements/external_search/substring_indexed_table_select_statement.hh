@@ -25,7 +25,7 @@ class substring_indexed_table_select_statement : public external_index_select_st
     std::optional<external_search::contains_pattern> _pattern;
     std::optional<expr::expression> _deferred_pattern;
     /// The range restriction on the ordered column, if the query carried one. Kept unevaluated
-    /// because a bound may be a bind marker; it is turned into sort keys at execution.
+    /// because a bound may be a bind marker; it is turned into typed bounds at execution.
     std::vector<expr::binary_operator> _sort_bounds;
     /// Whether the index was created with a sort column. Only such an index walks its matches in a
     /// defined order, and only then is there a position for a later page to resume from.
@@ -72,8 +72,11 @@ private:
 
     /// The keyword to search for and where it has to sit: settled at prepare, or the bound pattern's.
     external_search::contains_pattern evaluate_pattern(const query_options& options) const;
-    /// The range restriction as the index node's sort-key bounds: {min, max}, either may be empty.
-    std::pair<std::optional<uint64_t>, std::optional<uint64_t>> evaluate_sort_bounds(const query_options& options) const;
+    /// The range restriction as the bounds the index node takes: {min, max}, either may be empty,
+    /// each the column's own value and whether it is included. Several bounds on one side
+    /// collapse to the tightest, compared the way the column's type compares.
+    using sort_bound = vector_search::vector_store_client::sort_bound;
+    std::pair<std::optional<sort_bound>, std::optional<sort_bound>> evaluate_sort_bounds(const query_options& options) const;
 
     /// Where this page starts: the cursor the previous page ended at, and how much of the LIMIT is
     /// still unspent. The first page of a query, and every page of an unordered index, starts at
