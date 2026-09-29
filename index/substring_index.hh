@@ -61,6 +61,9 @@ public:
     /// Whether the index matches letter case exactly (the default, and CQL's LIKE semantics) or
     /// lowercases values and keywords on the index node.
     static bool case_sensitive(const index_metadata& im);
+    /// Whether the index was created with verify_candidates = 'index', which keeps the check of
+    /// long-keyword candidates on the index node even where ScyllaDB could do it.
+    static bool node_verifies_candidates(const index_metadata& im);
     /// The column the index orders its results by, or nothing when it was created without one and
     /// so answers in unspecified order.
     static std::optional<sstring> order_by(const index_metadata& im);
@@ -68,6 +71,7 @@ public:
 private:
     void check_target(const schema& schema, const std::vector<::shared_ptr<cql3::statements::index_target>>& targets) const;
     void check_index_options(const cql3::statements::index_specific_prop_defs& properties) const;
+    void check_verify_candidates(const cql3::statements::index_specific_prop_defs& properties) const;
     void check_order_by_column(const schema& schema, const cql3::statements::index_specific_prop_defs& properties) const;
 };
 

@@ -22,6 +22,7 @@
 import json
 
 import pytest
+from cassandra.protocol import InvalidRequest
 from cassandra.query import SimpleStatement
 from test.pylib.skip_types import skip_env
 
@@ -67,6 +68,15 @@ def make_table(cql, test_keyspace, options):
 def sensitive_table(cql, test_keyspace):
     """A case-sensitive ordered index: the coordinator can repeat the node's test, so it does."""
     table = make_table(cql, test_keyspace, "{'min_gram': '2', 'order_by': 'registered_at'}")
+    yield table
+    cql.execute(f"DROP TABLE {table}")
+
+
+@pytest.fixture(scope="module")
+def node_checks_table(cql, test_keyspace):
+    """A table the coordinator could check, created to leave the check on the node: the switch that
+    lets one run compare the two on the same index."""
+    table = make_table(cql, test_keyspace, "{'min_gram': '2', 'order_by': 'registered_at', 'verify_candidates': 'index'}")
     yield table
     cql.execute(f"DROP TABLE {table}")
 
@@ -246,3 +256,28 @@ def test_an_unpaged_query_is_topped_up_until_its_limit_is_met(cql, sensitive_tab
     )
     assert [row.id for row in cql.execute(statement)] == [3, 0]
     assert len(vector_store_mock.contains_requests) == 6
+
+
+def test_verify_candidates_index_keeps_the_check_on_the_node(cql, node_checks_table, vector_store_mock):
+    vector_store_mock.reset()
+    vector_store_mock.set_next_contains_response(200, contains_response([2, 0]))
+
+    rows = list(cql.execute(f"SELECT id FROM {node_checks_table} WHERE nickname LIKE '%hello%' LIMIT 10"))
+
+    assert [row.id for row in rows] == [2, 0]
+    assert vector_store_mock.contains_requests[0].verify is None
+
+
+def test_verify_candidates_scylla_is_refused_where_scylla_cannot_check(cql, test_keyspace):
+    """Asking for the coordinator's check on an index it cannot check is refused when the index is
+    created, rather than silently ignored."""
+    with new_test_table(cql, test_keyspace, "id int primary key, nickname text, registered_at timestamp") as table:
+        with pytest.raises(InvalidRequest, match="needs a case-sensitive index"):
+            cql.execute(f"CREATE CUSTOM INDEX ON {table}(nickname) USING 'substring_index' WITH OPTIONS = "
+                        "{'order_by': 'registered_at', 'case_sensitive': 'false', 'verify_candidates': 'scylla'}")
+        with pytest.raises(InvalidRequest, match="needs an 'order_by' option"):
+            cql.execute(f"CREATE CUSTOM INDEX ON {table}(nickname) USING 'substring_index' WITH OPTIONS = "
+                        "{'verify_candidates': 'scylla'}")
+        with pytest.raises(InvalidRequest, match="verify_candidates"):
+            cql.execute(f"CREATE CUSTOM INDEX ON {table}(nickname) USING 'substring_index' WITH OPTIONS = "
+                        "{'order_by': 'registered_at', 'verify_candidates': 'both'}")

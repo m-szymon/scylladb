@@ -23,6 +23,8 @@ const sstring min_gram_option = "min_gram";
 const sstring max_gram_option = "max_gram";
 const sstring case_sensitive_option = "case_sensitive";
 const sstring order_by_option = "order_by";
+const sstring verify_candidates_option = "verify_candidates";
+const std::vector<sstring> verify_candidates_values = {"index", "scylla"};
 
 void validate_placeholder_option(std::string_view index, const sstring& name, const sstring& value) {
     if (value.empty()) {
@@ -47,6 +49,11 @@ const std::unordered_map<sstring, std::function<void(std::string_view, const sst
                          format("Index {}: option '{}' must name a column", index, name));
              }
          }},
+        // Who checks the candidates for a keyword longer than max_gram: the index node against its
+        // stored text ('index'), or ScyllaDB against the rows it reads anyway ('scylla'). Absent,
+        // ScyllaDB checks whenever it can -- a case-sensitive index with 'order_by' -- and the
+        // node otherwise. Read by ScyllaDB only; the node never sees a request to change it.
+        {verify_candidates_option, std::bind_front(util::validate_enumerated_option, verify_candidates_values)},
         // Placeholders handed through to the index node untouched, so that an experimental knob on
         // its side can be set per index without a change here. What each one means is the index
         // node's business and may change between builds; nothing on this side reads them.
@@ -81,6 +88,11 @@ unsigned substring_index::min_gram(const index_metadata& im) {
 
 unsigned substring_index::max_gram(const index_metadata& im) {
     return gram_option(im.options(), max_gram_option, default_max_gram);
+}
+
+bool substring_index::node_verifies_candidates(const index_metadata& im) {
+    auto it = im.options().find(verify_candidates_option);
+    return it != im.options().end() && it->second == "index";
 }
 
 bool substring_index::case_sensitive(const index_metadata& im) {
@@ -156,6 +168,28 @@ void substring_index::validate(const schema& schema, const cql3::statements::ind
     check_cdc_options(schema);
     check_index_options(properties);
     check_order_by_column(schema, properties);
+    check_verify_candidates(properties);
+}
+
+void substring_index::check_verify_candidates(const cql3::statements::index_specific_prop_defs& properties) const {
+    const auto& options = properties.get_raw_options();
+    auto it = options.find(verify_candidates_option);
+    if (it == options.end() || it->second != "scylla") {
+        return;
+    }
+    // ScyllaDB's test is byte for byte, which is the node's only for a case-sensitive index, and a
+    // page it leaves short resumes from the node's cursor, which only an ordered index reports.
+    auto case_sensitive = options.find(case_sensitive_option);
+    if (case_sensitive != options.end() && case_sensitive->second == "false") {
+        throw exceptions::invalid_request_exception(
+                "Substring index option verify_candidates = 'scylla' needs a case-sensitive index: ScyllaDB cannot repeat the "
+                "index node's case folding");
+    }
+    if (!options.contains(order_by_option)) {
+        throw exceptions::invalid_request_exception(
+                "Substring index option verify_candidates = 'scylla' needs an 'order_by' option: without one the index reports "
+                "no cursor to resume a page from once ScyllaDB has dropped a candidate");
+    }
 }
 
 void substring_index::check_order_by_column(

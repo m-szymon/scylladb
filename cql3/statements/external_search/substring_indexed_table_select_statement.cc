@@ -214,8 +214,10 @@ public:
     // Checking here needs a case-sensitive index (its test is byte for byte) and an ordered one:
     // a page the check leaves short has to resume from the node's cursor, and only an ordered
     // index reports one. Otherwise the node keeps checking its own candidates.
+    // 'verify_candidates' = 'index' keeps it on the node even then, to compare the two.
     const bool verifies_candidates = secondary_index::substring_index::case_sensitive(index.metadata())
-            && secondary_index::substring_index::order_by(index.metadata()).has_value();
+            && secondary_index::substring_index::order_by(index.metadata()).has_value()
+            && !secondary_index::substring_index::node_verifies_candidates(index.metadata());
 
     std::optional<external_search::contains_pattern> literal;
     std::optional<expr::expression> deferred_pattern;
