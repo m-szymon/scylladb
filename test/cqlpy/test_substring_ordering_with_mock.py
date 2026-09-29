@@ -243,13 +243,71 @@ def test_an_ordered_index_still_serves_a_query_without_order_by(cql, ordered_tab
     assert sorted(row.id for row in rows) == [0, 2]
 
 
-def test_limit_is_still_required_and_capped_when_ordering(cql, ordered_table):
-    """Ordering does not loosen the limits: the index node is asked for a bounded page either way."""
+def test_an_unpaged_query_still_needs_a_bounded_limit(cql, ordered_table):
+    """Without paging the whole result comes back in one reply, so the LIMIT is what bounds it:
+    required, and at most 1000, ordered index or not."""
     table, _ = ordered_table
-    with pytest.raises(InvalidRequest, match="require a LIMIT"):
-        cql.execute(f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC")
+    unpaged = lambda text: SimpleStatement(text, fetch_size=None)
+    with pytest.raises(InvalidRequest, match="require a LIMIT unless they are paged"):
+        cql.execute(unpaged(f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC"))
     with pytest.raises(InvalidRequest, match="not greater than 1000"):
-        cql.execute(f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC LIMIT 1001")
+        cql.execute(unpaged(f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC LIMIT 1001"))
+
+
+def test_a_paged_query_needs_no_limit(cql, ordered_table, vector_store_mock):
+    """A page resumes from the node's cursor at a flat cost, so the page bounds each round trip and
+    the query may go without a LIMIT: the pages simply run until the node reports no more."""
+    table, _ = ordered_table
+    vector_store_mock.reset()
+    vector_store_mock.set_contains_responses([
+        (200, contains_response([4, 3], next_cursor="after-3")),
+        (200, contains_response([2, 1], next_cursor="after-1")),
+        (200, contains_response([0])),
+    ])
+
+    statement = SimpleStatement(
+        f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC", fetch_size=2)
+    assert [row.id for row in cql.execute(statement)] == [4, 3, 2, 1, 0]
+    assert [json.loads(r.body)["limit"] for r in vector_store_mock.contains_requests] == [2, 2, 2]
+
+
+def test_a_paged_query_may_ask_for_more_than_1000_rows(cql, ordered_table, vector_store_mock):
+    """The 1000 bounds one reply, not a paged query's total."""
+    table, _ = ordered_table
+    vector_store_mock.reset()
+    vector_store_mock.set_next_contains_response(200, contains_response([4, 3]))
+
+    statement = SimpleStatement(
+        f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC LIMIT 5000", fetch_size=100)
+    assert [row.id for row in cql.execute(statement)] == [4, 3]
+
+
+def test_a_large_page_is_cut_to_what_one_reply_may_hold(cql, ordered_table, vector_store_mock):
+    """A driver's default page is thousands of rows; the node is asked for at most 1000 of them,
+    which is a correct page since a page is a bound, not a promise."""
+    table, _ = ordered_table
+    vector_store_mock.reset()
+    vector_store_mock.set_next_contains_response(200, contains_response([4, 3]))
+
+    statement = SimpleStatement(
+        f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC", fetch_size=5000)
+    list(cql.execute(statement))
+    assert json.loads(vector_store_mock.contains_requests[0].body)["limit"] == 1000
+
+
+def test_one_prepared_statement_is_judged_by_how_it_is_executed(cql, ordered_table, vector_store_mock):
+    """Paging is a property of the execution, so the same prepared statement without a LIMIT runs
+    paged and is refused unpaged."""
+    table, _ = ordered_table
+    stmt = cql.prepare(f"SELECT id FROM {table} WHERE nickname LIKE ? ORDER BY registered_at DESC")
+    vector_store_mock.reset()
+    vector_store_mock.set_next_contains_response(200, contains_response([4]))
+
+    stmt.fetch_size = 10
+    assert [row.id for row in cql.execute(stmt, ["%ell%"])] == [4]
+    stmt.fetch_size = None
+    with pytest.raises(InvalidRequest, match="require a LIMIT unless they are paged"):
+        cql.execute(stmt, ["%ell%"])
 
 
 def test_a_cursor_in_the_reply_ends_the_query_when_the_limit_is_spent(cql, ordered_table, vector_store_mock):

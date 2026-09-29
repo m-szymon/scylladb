@@ -189,9 +189,8 @@ public:
         const secondary_index::index& index,
         std::unique_ptr<attributes> attrs) {
 
-    if (!limit.has_value()) {
-        throw exceptions::invalid_request_exception("Substring search queries require a LIMIT");
-    }
+    // Whether a LIMIT is needed depends on how the query is executed -- paged or not -- which
+    // only execution knows; execute_search checks it.
 
     if (per_partition_limit.has_value()) {
         throw exceptions::invalid_request_exception("Substring search queries do not support per-partition limits");
@@ -212,7 +211,11 @@ public:
     const auto* target_column = expr::as<expr::column_value>(like.lhs).col;
     const unsigned min_gram = secondary_index::substring_index::min_gram(index.metadata());
     const unsigned max_gram = secondary_index::substring_index::max_gram(index.metadata());
-    const bool verifies_candidates = secondary_index::substring_index::case_sensitive(index.metadata());
+    // Checking here needs a case-sensitive index (its test is byte for byte) and an ordered one:
+    // a page the check leaves short has to resume from the node's cursor, and only an ordered
+    // index reports one. Otherwise the node keeps checking its own candidates.
+    const bool verifies_candidates = secondary_index::substring_index::case_sensitive(index.metadata())
+            && secondary_index::substring_index::order_by(index.metadata()).has_value();
 
     std::optional<external_search::contains_pattern> literal;
     std::optional<expr::expression> deferred_pattern;
@@ -347,7 +350,9 @@ uint64_t substring_indexed_table_select_statement::page_size_for(const query_opt
     if (!_ordered || page_size <= 0) {
         return remaining;
     }
-    return std::min(static_cast<uint64_t>(page_size), remaining);
+    // A driver's default page is thousands of rows; a page is a bound, not a promise, so a
+    // shorter one keeps a single round trip's base-table read to what one LIMIT may ask for.
+    return std::min({static_cast<uint64_t>(page_size), remaining, max_substring_query_limit});
 }
 
 lw_shared_ptr<const service::pager::paging_state> substring_indexed_table_select_statement::next_page_state(
@@ -388,9 +393,24 @@ external_search::contains_pattern substring_indexed_table_select_statement::eval
 future<shared_ptr<cql_transport::messages::result_message>> substring_indexed_table_select_statement::execute_search(
         query_processor& qp, service::query_state& state, const query_options& options, uint64_t limit) const {
 
-    if (limit > max_substring_query_limit) {
-        co_await coroutine::return_exception(exceptions::invalid_request_exception(
-                fmt::format("Substring search queries require a LIMIT that is not greater than {}. LIMIT was {}", max_substring_query_limit, limit)));
+    // Every round trip has to cost a bounded amount. A paged query on an ordered index is
+    // bounded by its page, which resumes from the node's cursor at a flat cost, so its LIMIT
+    // only caps the total and may be anything or absent. Any other query returns its whole
+    // result at once, so the LIMIT is that bound and is required.
+    const bool bounded_by_page = _ordered && options.get_page_size() > 0;
+    if (!bounded_by_page) {
+        if (!_limit) {
+            co_await coroutine::return_exception(exceptions::invalid_request_exception(_ordered
+                    ? "Substring search queries require a LIMIT unless they are paged"
+                    : "Substring search queries require a LIMIT: this index was created without an 'order_by' option, so its results "
+                      "cannot be paged"));
+        }
+        if (limit > max_substring_query_limit) {
+            co_await coroutine::return_exception(exceptions::invalid_request_exception(fmt::format(
+                    "Substring search queries require a LIMIT that is not greater than {} unless they are paged on an index with an "
+                    "'order_by' option. LIMIT was {}",
+                    max_substring_query_limit, limit)));
+        }
     }
 
     auto timeout = db::timeout_clock::now() + get_timeout(state.get_client_state(), options);
@@ -465,7 +485,11 @@ future<shared_ptr<cql_transport::messages::result_message>> substring_indexed_ta
         next_cursor = page->next_cursor;
         cursor = page->next_cursor;
         const bool short_page = returned < page_limit && returned < remaining;
-        if (!_ordered || !cursor || !short_page || round == max_top_ups_per_page) {
+        // A paged client resumes a short page from its cursor, so the top-ups there only save it
+        // round trips and are bounded. An unpaged one ignores the cursor, so its one reply has to
+        // hold everything the LIMIT asks for: it is topped up until full or out of candidates.
+        const bool paged = options.get_page_size() > 0;
+        if (!_ordered || !cursor || !short_page || (paged && round == max_top_ups_per_page)) {
             break;
         }
     }

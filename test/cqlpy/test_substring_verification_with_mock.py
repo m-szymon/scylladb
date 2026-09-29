@@ -72,6 +72,15 @@ def sensitive_table(cql, test_keyspace):
 
 
 @pytest.fixture(scope="module")
+def unordered_table(cql, test_keyspace):
+    """A case-sensitive index with no sort column: a page the check left short could not resume,
+    since such an index reports no cursor, so the node keeps checking its own candidates."""
+    table = make_table(cql, test_keyspace, "{'min_gram': '2'}")
+    yield table
+    cql.execute(f"DROP TABLE {table}")
+
+
+@pytest.fixture(scope="module")
 def insensitive_table(cql, test_keyspace):
     """A case-insensitive index lowercases on the node with tables the coordinator does not
     share, so the node keeps checking its own candidates."""
@@ -204,3 +213,36 @@ def test_top_ups_are_bounded_and_a_short_page_is_still_a_page(cql, sensitive_tab
     requests = vector_store_mock.contains_requests
     assert len(requests) == 5
     assert requests[4].cursor == "c4"
+
+
+def test_an_unordered_index_keeps_checking_its_own_candidates(cql, unordered_table, vector_store_mock):
+    """Dropping a candidate here would lose a row for good on an index with no cursor to resume
+    from, so the request leaves verification to the node."""
+    vector_store_mock.reset()
+    vector_store_mock.set_next_contains_response(200, contains_response([2, 0]))
+
+    rows = list(cql.execute(f"SELECT id FROM {unordered_table} WHERE nickname LIKE '%hello%' LIMIT 10"))
+
+    assert sorted(row.id for row in rows) == [0, 2]
+    assert vector_store_mock.contains_requests[0].verify is None
+
+
+def test_an_unpaged_query_is_topped_up_until_its_limit_is_met(cql, sensitive_table, vector_store_mock):
+    """An unpaged client reads one reply and ignores any cursor, so a short reply would be a lost
+    row. The top-ups are not bounded then: they run until the LIMIT is met or the node runs out."""
+    vector_store_mock.reset()
+    vector_store_mock.set_contains_responses([
+        (200, contains_response([4], next_cursor="c1", verified=False)),
+        (200, contains_response([4], next_cursor="c2", verified=False)),
+        (200, contains_response([4], next_cursor="c3", verified=False)),
+        (200, contains_response([4], next_cursor="c4", verified=False)),
+        (200, contains_response([3], next_cursor="c5", verified=False)),
+        (200, contains_response([0], verified=False)),
+    ])
+
+    statement = SimpleStatement(
+        f"SELECT id FROM {sensitive_table} WHERE nickname LIKE '%hello%' ORDER BY registered_at DESC LIMIT 2",
+        fetch_size=None,
+    )
+    assert [row.id for row in cql.execute(statement)] == [3, 0]
+    assert len(vector_store_mock.contains_requests) == 6

@@ -535,13 +535,19 @@ scan, so it needs no ``ALLOW FILTERING``:
 
    substring_query: SELECT ... FROM `table_name`
                   :   WHERE `column_name` LIKE '%' `keyword` '%'
-                  :   LIMIT `integer`
+                  :   [ AND `order_by_column` ( '<' | '<=' | '>' | '>=' ) `value` ... ]
+                  :   [ ORDER BY `order_by_column` ( ASC | DESC ) ]
+                  :   [ LIMIT `integer` ]
 
-Example::
+Examples::
 
     SELECT user_id, nickname FROM users
         WHERE nickname LIKE '%将军%'
         LIMIT 20;
+
+    SELECT user_id, nickname FROM users
+        WHERE nickname LIKE '%将军%' AND register_time < '2024-03-01'
+        ORDER BY register_time DESC;
 
 The rules are:
 
@@ -554,11 +560,18 @@ The rules are:
 * A bind marker may stand for the pattern (``LIKE ?``). The index is chosen when the statement is
   prepared, so the bound pattern is checked when the statement is executed, and a pattern the index
   does not serve is then rejected rather than scanned.
-* ``LIMIT`` is mandatory and must not exceed 1000. ``ORDER BY``, ``PER PARTITION LIMIT``, ``GROUP BY``,
-  aggregation and any further ``WHERE`` restriction are not supported.
-* The matching rows are returned in no particular order, like any other ``LIKE`` filter, and without
-  paging; when the requested page size is smaller than ``LIMIT`` the whole result is returned with a
-  warning.
+* On an index created with an ``'order_by'`` option, the query may order by that column, ``ASC`` or
+  ``DESC``, and restrict it with ``<``, ``<=``, ``>`` and ``>=``. Rows sharing a value of the column are
+  returned in an order of the index's choosing. No other column may be ordered by or restricted, and
+  ``PER PARTITION LIMIT``, ``GROUP BY`` and aggregation are not supported.
+* Such a query is paged: each page resumes where the previous one ended, at the same cost whatever
+  its depth. A paged query needs no ``LIMIT``, and when it has one, ``LIMIT`` caps the rows returned
+  over all pages. A page holds at most 1000 rows and may hold fewer than the page size asked for, even
+  when more rows follow; drivers fetch the next page transparently.
+* A query that is not paged, or one on an index without ``'order_by'``, returns its whole result at
+  once, so it requires a ``LIMIT`` of at most 1000. On an index without ``'order_by'`` the rows come in
+  no particular order, and when the page size asked for is smaller than ``LIMIT`` the whole result is
+  returned with a warning.
 * Matching is case-sensitive, like ``LIKE``, unless the index was created with
   ``'case_sensitive': 'false'``.
 

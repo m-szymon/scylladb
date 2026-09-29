@@ -24,8 +24,10 @@ class substring_indexed_table_select_statement : public external_index_select_st
     /// has to check them against the value.
     unsigned _max_gram;
     /// Whether this statement can do that check: byte for byte, which is the node's own test for
-    /// a case-sensitive index. A case-insensitive index lowercases with the node's Unicode
-    /// tables, which this side does not share, so it leaves the check to the node.
+    /// a case-sensitive index, and resumable, which needs the cursor only an ordered index
+    /// reports. A case-insensitive index lowercases with the node's Unicode tables, which this
+    /// side does not share, and an unordered one could not resume a page the check left short,
+    /// so both leave the check to the node.
     bool _verifies_candidates;
     // Exactly one of the two is set: the keyword and kind a literal pattern yielded at prepare, or
     // the pattern that only execution can evaluate and check, a bind marker standing there.
@@ -102,10 +104,10 @@ private:
     /// the value the base read fetched for that purpose.
     bool verifies_here(const external_search::contains_pattern& pattern) const;
 
-    /// How many times a page is topped up from the node's cursor after filtering left it short,
-    /// before it is handed to the client as it is. A short page is a correct page -- the client
-    /// asks for the next one -- so this only bounds the work a keyword with many false
-    /// candidates can cost in one round trip.
+    /// How many times a paged query's page is topped up from the node's cursor after filtering
+    /// left it short, before it is handed to the client as it is. A short page is a correct page
+    /// -- the client asks for the next one -- so this only bounds the work a keyword with many
+    /// false candidates can cost in one round trip. An unpaged query is topped up until full.
     static constexpr unsigned max_top_ups_per_page = 3;
 
     future<::shared_ptr<cql_transport::messages::result_message>> execute_search(

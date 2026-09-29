@@ -103,10 +103,12 @@ Limitations
   served. Any other pattern -- a wildcard or an escape inside the keyword, a
   lone ``%`` -- still needs ``ALLOW FILTERING``.
 * The keyword must be at least ``min_gram`` characters long.
-* ``LIMIT`` is required and capped at 1000; results are not ordered and not
-  paged.
-* One ``LIKE`` per query, and no other ``WHERE`` restriction, ``ORDER BY``,
-  ``GROUP BY`` or aggregation.
+* Results are ordered, ranged over and paged only on the one column the index
+  was created with (``'order_by'``). Without it, results come in no particular
+  order and in a single page, and ``LIMIT`` is required and capped at 1000.
+* A query that is not paged always needs a ``LIMIT`` of at most 1000.
+* One ``LIKE`` per query, and no other ``WHERE`` restriction, ``GROUP BY`` or
+  aggregation.
 
 Authorization
 -------------
