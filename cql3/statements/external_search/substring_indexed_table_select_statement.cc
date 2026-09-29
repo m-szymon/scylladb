@@ -15,6 +15,9 @@
 #include "cql3/expr/expr-utils.hh"
 #include "cql3/query_processor.hh"
 #include "cql3/restrictions/statement_restrictions.hh"
+#include "cql3/selection/selection.hh"
+#include "query/query-result-reader.hh"
+#include "transport/messages/result_message.hh"
 #include "index/substring_index.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "db/consistency_level_validations.hh"
@@ -144,6 +147,37 @@ std::optional<vector_search::vector_store_client::contains_order> validate_order
             : vector_search::vector_store_client::contains_order::descending;
 }
 
+/// Drops the rows the index node nominated but that do not hold the pattern. The value is the
+/// target column, fetched for this purpose (`add_column_for_post_processing`) whether or not the
+/// query selects it; a row without one cannot match.
+class pattern_filter {
+    const external_search::contains_pattern& _pattern;
+    int32_t _value_index;
+    mutable uint64_t _dropped = 0;
+
+public:
+    pattern_filter(const external_search::contains_pattern& pattern, int32_t value_index)
+        : _pattern(pattern)
+        , _value_index(value_index) {
+    }
+
+    bool operator()(const selection::selection& selection, const std::vector<bytes>&, const std::vector<bytes>&,
+            const query::result_row_view& static_row, const query::result_row_view* row) const {
+        auto values = expr::get_non_pk_values(selection, static_row, row);
+        const auto& value = values.at(_value_index);
+        const bool matches = value && _pattern.matches(std::string_view(reinterpret_cast<const char*>(to_bytes(*value).data()), value->size()));
+        if (!matches) {
+            ++_dropped;
+        }
+        return matches;
+    }
+    void reset(const partition_key* = nullptr) {
+    }
+    uint64_t get_rows_dropped() const {
+        return _dropped;
+    }
+};
+
 } // anonymous namespace
 
 ::shared_ptr<cql3::statements::select_statement> substring_indexed_table_select_statement::prepare(data_dictionary::database db,
@@ -177,6 +211,8 @@ std::optional<vector_search::vector_store_client::contains_order> validate_order
     const auto& like = found.like;
     const auto* target_column = expr::as<expr::column_value>(like.lhs).col;
     const unsigned min_gram = secondary_index::substring_index::min_gram(index.metadata());
+    const unsigned max_gram = secondary_index::substring_index::max_gram(index.metadata());
+    const bool verifies_candidates = secondary_index::substring_index::case_sensitive(index.metadata());
 
     std::optional<external_search::contains_pattern> literal;
     std::optional<expr::expression> deferred_pattern;
@@ -196,6 +232,12 @@ std::optional<vector_search::vector_store_client::contains_order> validate_order
         deferred_pattern = like.rhs;
     }
 
+    // The value is read along with the row whenever this side may have to check it: a literal
+    // pattern past max_gram, or a bound one, whose length only execution knows.
+    if (verifies_candidates && (!literal || literal->framed_length() > max_gram)) {
+        selection->add_column_for_post_processing(*target_column);
+    }
+
     return ::make_shared<cql3::statements::substring_indexed_table_select_statement>(
             schema,
             bound_terms,
@@ -211,6 +253,8 @@ std::optional<vector_search::vector_store_client::contains_order> validate_order
             index,
             target_column,
             min_gram,
+            max_gram,
+            verifies_candidates,
             std::move(literal),
             std::move(deferred_pattern),
             std::move(found.sort_bounds),
@@ -224,15 +268,17 @@ substring_indexed_table_select_statement::substring_indexed_table_select_stateme
         ::shared_ptr<std::vector<size_t>> group_by_cell_indices, bool is_reversed,
         ordering_comparator_type ordering_comparator, std::optional<expr::expression> limit,
         std::optional<expr::expression> per_partition_limit, cql_stats& stats,
-        const secondary_index::index& index, const column_definition* target_column, unsigned min_gram,
-        std::optional<external_search::contains_pattern> pattern, std::optional<expr::expression> deferred_pattern,
-        std::vector<expr::binary_operator> sort_bounds, std::optional<vector_search::vector_store_client::contains_order> order,
-        std::unique_ptr<attributes> attrs)
+        const secondary_index::index& index, const column_definition* target_column, unsigned min_gram, unsigned max_gram,
+        bool verifies_candidates, std::optional<external_search::contains_pattern> pattern,
+        std::optional<expr::expression> deferred_pattern, std::vector<expr::binary_operator> sort_bounds,
+        std::optional<vector_search::vector_store_client::contains_order> order, std::unique_ptr<attributes> attrs)
     : external_index_select_statement{schema, bound_terms, parameters, selection, restrictions,
               group_by_cell_indices, is_reversed, ordering_comparator, limit, per_partition_limit,
               stats, index, std::move(attrs)}
     , _target_column{target_column}
     , _min_gram{min_gram}
+    , _max_gram{max_gram}
+    , _verifies_candidates{verifies_candidates}
     , _pattern{std::move(pattern)}
     , _deferred_pattern{std::move(deferred_pattern)}
     , _sort_bounds{std::move(sort_bounds)}
@@ -305,9 +351,8 @@ uint64_t substring_indexed_table_select_statement::page_size_for(const query_opt
 }
 
 lw_shared_ptr<const service::pager::paging_state> substring_indexed_table_select_statement::next_page_state(
-        const vector_search::vector_store_client::contains_page& page, uint64_t remaining) const {
-    auto left = remaining - page.keys.size();
-    if (!_ordered || !page.next_cursor || left == 0) {
+        const std::optional<sstring>& cursor, uint64_t left) const {
+    if (!_ordered || !cursor || left == 0) {
         return nullptr;
     }
     // Only the cursor and the remaining count mean anything here: this statement reads the base
@@ -316,7 +361,11 @@ lw_shared_ptr<const service::pager::paging_state> substring_indexed_table_select
     return make_lw_shared<const service::pager::paging_state>(partition_key::make_empty(), std::nullopt,
             static_cast<uint32_t>(left), query_id::create_null_id(), service::pager::paging_state::replicas_per_token_range{},
             std::nullopt, 0, static_cast<uint32_t>(left >> 32), 0, bound_weight::equal, partition_region::partition_start,
-            std::nullopt, *page.next_cursor);
+            std::nullopt, *cursor);
+}
+
+bool substring_indexed_table_select_statement::verifies_here(const external_search::contains_pattern& pattern) const {
+    return _verifies_candidates && pattern.framed_length() > _max_gram;
 }
 
 external_search::contains_pattern substring_indexed_table_select_statement::evaluate_pattern(const query_options& options) const {
@@ -360,22 +409,80 @@ future<shared_ptr<cql_transport::messages::result_message>> substring_indexed_ta
     // do_execute adds.
     auto [cursor, remaining] = resume_point(options, limit);
     auto page_limit = page_size_for(options, remaining);
-
-    auto page = co_await qp.vector_store_client().contains(_schema->ks_name(), _index.metadata().name(), _schema,
-            std::string(pattern.keyword), pattern.kind, page_limit, std::move(cursor), _order, std::move(min_sort_value), std::move(max_sort_value),
-            aoe.abort_source());
-    if (!page.has_value()) {
-        co_await coroutine::return_exception(
-                exceptions::invalid_request_exception(std::visit(vector_search::vector_store_client::contains_error_visitor{}, page.error())));
+    const bool verify_here = verifies_here(pattern);
+    // The value to check is in the selection only when prepare saw that it might be needed; a
+    // pattern that needs it without it is a disagreement between prepare and execute.
+    const int32_t value_index = verify_here ? _selection->index_of(*_target_column) : -1;
+    if (verify_here && value_index < 0) {
+        on_internal_error(sslogger, "substring search verifies a pattern but did not fetch the value to verify it on");
     }
 
-    throwing_assert(page->keys.size() <= page_limit);
+    // The rows are read a node page at a time into one result set. The index node returns the
+    // keys in the order it wants them read -- its own for an unordered index, the ORDER BY's
+    // direction for one with a sort column -- and query_base_table preserves that order on both
+    // of its paths, so no score provider and no re-sorting are needed. When this side does the
+    // checking, a page can come back short; it is topped up from the node's cursor a bounded
+    // number of times, and past that handed over short, which a paging client takes in its stride.
+    auto command = prepare_command_for_base_query(qp, state, options, page_limit);
+    cql3::selection::result_set_builder builder(*_selection, _query_start_time_point, &options);
+    // The bounds are sent with every round, and a JSON value only moves.
+    auto copy_of = [](const std::optional<sort_bound>& bound) -> std::optional<sort_bound> {
+        if (!bound) {
+            return std::nullopt;
+        }
+        return sort_bound{rjson::copy(bound->value), bound->inclusive};
+    };
+    uint64_t returned = 0;
+    std::optional<sstring> next_cursor;
+    for (unsigned round = 0;; ++round) {
+        auto page = co_await qp.vector_store_client().contains(_schema->ks_name(), _index.metadata().name(), _schema,
+                std::string(pattern.keyword), pattern.kind, page_limit - returned, std::move(cursor), _order, copy_of(min_sort_value),
+                copy_of(max_sort_value), !verify_here, aoe.abort_source());
+        if (!page.has_value()) {
+            co_await coroutine::return_exception(
+                    exceptions::invalid_request_exception(std::visit(vector_search::vector_store_client::contains_error_visitor{}, page.error())));
+        }
+        throwing_assert(page->keys.size() <= page_limit - returned);
+        if (!page->verified && value_index < 0) {
+            on_internal_error(sslogger, "the index node returned candidates for a pattern this statement expected it to verify");
+        }
 
-    // The index node returns the keys in the order it wants them read -- its own for an unordered
-    // index, the ORDER BY's direction for one with a sort column -- and query_base_table preserves
-    // that order on both of its paths, so no score provider and no re-sorting are needed here.
-    co_return co_await query_base_table(
-            qp, state, options, page->keys, timeout, nullptr, next_page_state(*page, remaining));
+        auto rows = co_await query_base_table(qp, state, options, command, timeout, page->keys);
+        if (!rows) {
+            co_return ::make_shared<cql_transport::messages::result_message::exception>(std::move(rows).assume_error());
+        }
+        co_await builder.with_thread_if_needed([&] {
+            using builder_t = cql3::selection::result_set_builder;
+            if (page->verified) {
+                query::result_view::consume(*rows.value(), command->slice,
+                        builder_t::visitor<builder_t::nop_filter>(builder, *_query_schema, *_selection, builder_t::nop_filter()));
+            } else {
+                query::result_view::consume(*rows.value(), command->slice,
+                        builder_t::visitor<pattern_filter>(builder, *_query_schema, *_selection, pattern_filter(pattern, value_index)));
+            }
+        });
+        returned = builder.result_set_size();
+        next_cursor = page->next_cursor;
+        cursor = page->next_cursor;
+        const bool short_page = returned < page_limit && returned < remaining;
+        if (!_ordered || !cursor || !short_page || round == max_top_ups_per_page) {
+            break;
+        }
+    }
+
+    std::unique_ptr<cql3::result_set> result_set;
+    co_await builder.with_thread_if_needed([&] {
+        result_set = builder.build();
+    });
+    // The builder gave the result its own copy of the selection's metadata, so the paging state
+    // goes on the result and nothing shared between executions is touched.
+    if (auto next_page = next_page_state(next_cursor, remaining - returned)) {
+        result_set->get_metadata().maybe_set_paging_state(std::move(next_page));
+    } else {
+        result_set->get_metadata().clear_paging_state();
+    }
+    update_stats_rows_read(result_set->size());
+    co_return ::make_shared<cql_transport::messages::result_message::rows>(result(std::move(result_set)));
 }
 
 } // namespace cql3::statements

@@ -56,4 +56,26 @@ std::expected<contains_pattern, contains_pattern_error> parse_contains_pattern(s
     return contains_pattern{seastar::sstring(keyword), kind};
 }
 
+bool contains_pattern::matches(std::string_view value) const {
+    using contains_kind = vector_search::vector_store_client::contains_kind;
+    const std::string_view keyword{this->keyword};
+    switch (kind) {
+    case contains_kind::containment:
+        return value.find(keyword) != std::string_view::npos;
+    case contains_kind::prefix:
+        return value.starts_with(keyword);
+    case contains_kind::suffix:
+        return value.ends_with(keyword);
+    }
+    return false;
+}
+
+unsigned contains_pattern::framed_length() const {
+    using contains_kind = vector_search::vector_store_client::contains_kind;
+    const auto characters = static_cast<unsigned>(std::ranges::count_if(keyword, [](char c) {
+        return (static_cast<unsigned char>(c) & 0xC0) != 0x80;
+    }));
+    return characters + (kind == contains_kind::containment ? 0 : 1);
+}
+
 } // namespace cql3::statements::external_search

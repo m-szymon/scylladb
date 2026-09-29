@@ -79,6 +79,16 @@ unsigned substring_index::min_gram(const index_metadata& im) {
     return gram_option(im.options(), min_gram_option, default_min_gram);
 }
 
+unsigned substring_index::max_gram(const index_metadata& im) {
+    return gram_option(im.options(), max_gram_option, default_max_gram);
+}
+
+bool substring_index::case_sensitive(const index_metadata& im) {
+    auto it = im.options().find(case_sensitive_option);
+    // Validated against util::boolean_values at CREATE INDEX, so it is one of the two.
+    return it == im.options().end() ? default_case_sensitive : it->second == "true";
+}
+
 std::optional<sstring> substring_index::order_by(const index_metadata& im) {
     auto it = im.options().find(order_by_option);
     if (it == im.options().end()) {

@@ -27,6 +27,16 @@ struct contains_pattern_error {
 struct contains_pattern {
     seastar::sstring keyword;
     vector_search::vector_store_client::contains_kind kind;
+
+    /// Whether `value` satisfies the pattern, byte for byte: the keyword occurs anywhere in it, at
+    /// its start or at its end according to `kind`. This is the index node's own test for a
+    /// case-sensitive index, so a row it nominated can be checked here instead of there.
+    bool matches(std::string_view value) const;
+
+    /// The keyword's length as the index node measures it against `max_gram`: in characters, plus
+    /// the mark the node puts at the anchored end of a prefix or suffix pattern. A pattern longer
+    /// than `max_gram` is answered by candidates that hold every gram, not by exact matches.
+    unsigned framed_length() const;
 };
 
 /// Reads the keyword and its kind out of a LIKE pattern a substring index can answer: exactly

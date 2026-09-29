@@ -242,8 +242,8 @@ auto sort_bound_json(sort_bound const& bound) -> rjson::value {
 }
 
 auto write_contains_json(query_string keyword, contains_kind kind, limit limit, std::optional<sstring> const& cursor,
-        std::optional<contains_order> order, std::optional<sort_bound> const& min_sort_value, std::optional<sort_bound> const& max_sort_value)
-        -> json_content {
+        std::optional<contains_order> order, std::optional<sort_bound> const& min_sort_value, std::optional<sort_bound> const& max_sort_value,
+        bool verify) -> json_content {
     auto body = rjson::empty_object();
     rjson::add(body, "query", rjson::from_string(keyword));
     // Containment is the index node's default, so only the other two kinds are spelled out.
@@ -270,7 +270,25 @@ auto write_contains_json(query_string keyword, contains_kind kind, limit limit, 
     if (max_sort_value) {
         rjson::add(body, "max_sort_value", sort_bound_json(*max_sort_value));
     }
+    // Verification is the index node's default, so only declining it is spelled out.
+    if (!verify) {
+        rjson::add(body, "verify", rjson::value(false));
+    }
     return rjson::print(body);
+}
+
+/// Whether the page's keys are matches rather than candidates. Absent means verified, which is
+/// what an index node that never heard of the flag would have done.
+auto read_verified_json(rjson::value const& json) -> std::expected<bool, ann_error> {
+    auto const* verified_json = rjson::find(json, "verified");
+    if (verified_json == nullptr || verified_json->IsNull()) {
+        return true;
+    }
+    if (!verified_json->IsBool()) {
+        vslogger.error("Vector Store returned invalid JSON: 'verified' is not a boolean");
+        return std::unexpected{service_reply_format_error{}};
+    }
+    return verified_json->GetBool();
 }
 
 /// The cursor a page reports, if any. Absent is normal -- an unordered index never reports one --
@@ -583,9 +601,9 @@ struct vector_store_client::impl {
 
     auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, contains_kind kind, limit limit,
             std::optional<sstring> cursor, std::optional<vector_store_client::contains_order> order, std::optional<sort_bound> min_sort_value,
-            std::optional<sort_bound> max_sort_value, abort_source& as) -> future<std::expected<contains_page, contains_error>> {
+            std::optional<sort_bound> max_sort_value, bool verify, abort_source& as) -> future<std::expected<contains_page, contains_error>> {
         auto content = co_await post_to_index("contains", format("/api/v1/indexes/{}/{}/contains", keyspace, name),
-                write_contains_json(std::move(keyword), kind, limit, cursor, order, min_sort_value, max_sort_value), as);
+                write_contains_json(std::move(keyword), kind, limit, cursor, order, min_sort_value, max_sort_value, verify), as);
         if (!content) {
             co_return std::unexpected{content.error()};
         }
@@ -600,7 +618,11 @@ struct vector_store_client::impl {
             if (!next_cursor) {
                 co_return std::unexpected{next_cursor.error()};
             }
-            co_return contains_page{std::move(*keys), std::move(*next_cursor)};
+            auto verified = read_verified_json(json);
+            if (!verified) {
+                co_return std::unexpected{verified.error()};
+            }
+            co_return contains_page{std::move(*keys), std::move(*next_cursor), *verified};
         } catch (const rjson::error& e) {
             vslogger.error("Vector Store returned invalid JSON: {}", e.what());
             co_return std::unexpected{service_reply_format_error{}};
@@ -686,9 +708,9 @@ auto vector_store_client::bm25(keyspace_name keyspace, index_name name, schema_p
 
 auto vector_store_client::contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, contains_kind kind, limit limit,
         std::optional<sstring> cursor, std::optional<contains_order> order, std::optional<sort_bound> min_sort_value, std::optional<sort_bound> max_sort_value,
-        abort_source& as) -> future<std::expected<contains_page, contains_error>> {
+        bool verify, abort_source& as) -> future<std::expected<contains_page, contains_error>> {
     return _impl->contains(std::move(keyspace), std::move(name), schema, std::move(keyword), kind, limit, std::move(cursor), order,
-            std::move(min_sort_value), std::move(max_sort_value), as);
+            std::move(min_sort_value), std::move(max_sort_value), verify, as);
 }
 
 auto vector_store_client::highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents documents, abort_source& as)

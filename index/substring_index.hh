@@ -31,6 +31,7 @@ public:
     // an index created without the option.
     static constexpr unsigned default_min_gram = 1;
     static constexpr unsigned default_max_gram = 3;
+    static constexpr bool default_case_sensitive = true;
     static constexpr unsigned max_gram_limit = 8;
 
     std::string_view index_type_name() const override {
@@ -54,6 +55,12 @@ public:
     static bool is_substring_index(const index_metadata& im);
     /// The `min_gram` the index was created with, or the default.
     static unsigned min_gram(const index_metadata& im);
+    /// The `max_gram` the index was created with, or the default. A keyword longer than this is
+    /// answered from candidates holding every gram of it, and something has to check them.
+    static unsigned max_gram(const index_metadata& im);
+    /// Whether the index matches letter case exactly (the default, and CQL's LIKE semantics) or
+    /// lowercases values and keywords on the index node.
+    static bool case_sensitive(const index_metadata& im);
     /// The column the index orders its results by, or nothing when it was created without one and
     /// so answers in unspecified order.
     static std::optional<sstring> order_by(const index_metadata& im);

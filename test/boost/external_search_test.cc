@@ -175,4 +175,44 @@ BOOST_AUTO_TEST_CASE(parse_contains_pattern_counts_characters_against_min_gram) 
     BOOST_REQUIRE(parse_contains_pattern("%\U0001F600\U0001F601%", 2));
 }
 
+// --- contains_pattern::matches / framed_length -------------------------------------------------
+//
+// The coordinator applies these to the rows the index node nominated for a keyword past
+// max_gram, so they have to be the node's own test: byte for byte, anchored as the kind says.
+
+BOOST_AUTO_TEST_CASE(a_pattern_matches_a_value_the_way_its_kind_says) {
+    using cql3::statements::external_search::contains_pattern;
+    using kind = vector_search::vector_store_client::contains_kind;
+    contains_pattern anywhere{"llo", kind::containment};
+    BOOST_REQUIRE(anywhere.matches("hello"));
+    BOOST_REQUIRE(anywhere.matches("llo"));
+    BOOST_REQUIRE(!anywhere.matches("hxlo"));
+    contains_pattern prefix{"hel", kind::prefix};
+    BOOST_REQUIRE(prefix.matches("hello"));
+    BOOST_REQUIRE(!prefix.matches("say hello"));
+    contains_pattern suffix{"llo", kind::suffix};
+    BOOST_REQUIRE(suffix.matches("say hello"));
+    BOOST_REQUIRE(!suffix.matches("hello world"));
+    // Case is not folded: that is the case-sensitive index's contract, and the only one the
+    // coordinator repeats.
+    BOOST_REQUIRE(!anywhere.matches("HELLO"));
+    // Bytes, not characters: a multi-byte keyword matches its own bytes only.
+    contains_pattern cjk{"\u5c06\u519b", kind::containment};
+    BOOST_REQUIRE(cjk.matches("\u5b87\u5c06\u519b"));
+    BOOST_REQUIRE(!cjk.matches("\u5c06\u5b87\u519b"));
+}
+
+BOOST_AUTO_TEST_CASE(framed_length_counts_characters_plus_the_anchor_mark) {
+    using cql3::statements::external_search::contains_pattern;
+    using kind = vector_search::vector_store_client::contains_kind;
+    BOOST_REQUIRE_EQUAL((contains_pattern{"abc", kind::containment}).framed_length(), 3u);
+    // The node frames every value and anchors a prefix or suffix on the frame mark, which is one
+    // more character of the pattern it looks up.
+    BOOST_REQUIRE_EQUAL((contains_pattern{"abc", kind::prefix}).framed_length(), 4u);
+    BOOST_REQUIRE_EQUAL((contains_pattern{"abc", kind::suffix}).framed_length(), 4u);
+    // Characters, not bytes.
+    BOOST_REQUIRE_EQUAL((contains_pattern{"\u5b87\u5c06\u519b", kind::containment}).framed_length(), 3u);
+    BOOST_REQUIRE_EQUAL((contains_pattern{"\U0001F600", kind::suffix}).framed_length(), 2u);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

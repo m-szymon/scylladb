@@ -20,6 +20,13 @@ namespace cql3::statements {
 class substring_indexed_table_select_statement : public external_index_select_statement {
     const column_definition* _target_column;
     unsigned _min_gram;
+    /// Past this many characters the index node has candidates rather than matches, and one side
+    /// has to check them against the value.
+    unsigned _max_gram;
+    /// Whether this statement can do that check: byte for byte, which is the node's own test for
+    /// a case-sensitive index. A case-insensitive index lowercases with the node's Unicode
+    /// tables, which this side does not share, so it leaves the check to the node.
+    bool _verifies_candidates;
     // Exactly one of the two is set: the keyword and kind a literal pattern yielded at prepare, or
     // the pattern that only execution can evaluate and check, a bind marker standing there.
     std::optional<external_search::contains_pattern> _pattern;
@@ -56,10 +63,10 @@ public:
             ::shared_ptr<selection::selection> selection, ::shared_ptr<const restrictions::select_restrictions> restrictions,
             ::shared_ptr<std::vector<size_t>> group_by_cell_indices, bool is_reversed, ordering_comparator_type ordering_comparator,
             std::optional<expr::expression> limit, std::optional<expr::expression> per_partition_limit, cql_stats& stats,
-            const secondary_index::index& index, const column_definition* target_column, unsigned min_gram,
-            std::optional<external_search::contains_pattern> pattern, std::optional<expr::expression> deferred_pattern,
-            std::vector<expr::binary_operator> sort_bounds, std::optional<vector_search::vector_store_client::contains_order> order,
-            std::unique_ptr<cql3::attributes> attrs);
+            const secondary_index::index& index, const column_definition* target_column, unsigned min_gram, unsigned max_gram,
+            bool verifies_candidates, std::optional<external_search::contains_pattern> pattern,
+            std::optional<expr::expression> deferred_pattern, std::vector<expr::binary_operator> sort_bounds,
+            std::optional<vector_search::vector_store_client::contains_order> order, std::unique_ptr<cql3::attributes> attrs);
 
 private:
     std::string_view index_search_type_name() const override {
@@ -85,9 +92,21 @@ private:
     /// How many keys to ask the index node for: the page size when the client set one and this
     /// index can page, otherwise everything still owed.
     uint64_t page_size_for(const query_options& options, uint64_t remaining) const;
-    /// The paging state to hand the client, or nullptr when this page is the last one.
-    lw_shared_ptr<const service::pager::paging_state> next_page_state(
-            const vector_search::vector_store_client::contains_page& page, uint64_t remaining) const;
+    /// The paging state to hand the client: the index node's cursor and what is left of the
+    /// LIMIT, or nullptr when there is nothing more to read.
+    lw_shared_ptr<const service::pager::paging_state> next_page_state(const std::optional<sstring>& cursor, uint64_t left) const;
+
+    /// Whether this statement, not the index node, checks the rows for `pattern`: the pattern is
+    /// past `max_gram`, so the node only has candidates, and the index is one whose test this
+    /// side can repeat. The node is then asked not to verify, and the rows are filtered here on
+    /// the value the base read fetched for that purpose.
+    bool verifies_here(const external_search::contains_pattern& pattern) const;
+
+    /// How many times a page is topped up from the node's cursor after filtering left it short,
+    /// before it is handed to the client as it is. A short page is a correct page -- the client
+    /// asks for the next one -- so this only bounds the work a keyword with many false
+    /// candidates can cost in one round trip.
+    static constexpr unsigned max_top_ups_per_page = 3;
 
     future<::shared_ptr<cql_transport::messages::result_message>> execute_search(
             query_processor& qp, service::query_state& state, const query_options& options, uint64_t limit) const override;

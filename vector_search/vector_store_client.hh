@@ -70,6 +70,10 @@ public:
     struct contains_page {
         primary_keys keys;
         std::optional<sstring> next_cursor;
+        /// Whether every key is a match. False only when the request declined verification and
+        /// the keyword was past the index's `max_gram`: the keys are then rows holding every
+        /// gram of it, and the caller applies the pattern to the rows it reads.
+        bool verified = true;
     };
     /// The direction an ordered containment search walks its sort column in.
     enum class contains_order {
@@ -160,9 +164,13 @@ public:
     /// and reports where the next page resumes; `cursor` carries that back to read it. An
     /// unordered index ignores both and reports no cursor, which is why the ability to order is a
     /// property of the index rather than of the request.
+    ///
+    /// `verify` false tells the index not to check a keyword past its `max_gram` against the
+    /// stored text: the page is then candidates, flagged as such, for the caller to check on the
+    /// rows it reads anyway.
     auto contains(keyspace_name keyspace, index_name name, schema_ptr schema, query_string keyword, contains_kind kind, limit limit,
             std::optional<sstring> cursor, std::optional<contains_order> order, std::optional<sort_bound> min_sort_value,
-            std::optional<sort_bound> max_sort_value, abort_source& as) -> future<std::expected<contains_page, contains_error>>;
+            std::optional<sort_bound> max_sort_value, bool verify, abort_source& as) -> future<std::expected<contains_page, contains_error>>;
 
     /// Request a fragment of each of the given documents, with the terms of `fts_query` marked.
     ///

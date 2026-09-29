@@ -27,12 +27,14 @@ class ContainsRequest(Request):
     """A `/contains` request with the paging, ordering and kind fields of its body picked out.
 
     `cursor` is the opaque string a previous reply's `next_cursor` handed back, `order` is
-    "asc" or "desc", `kind` is "prefix" or "suffix" (a containment request carries none); each is
-    None when the body omits it. The raw body stays in `body`.
+    "asc" or "desc", `kind` is "prefix" or "suffix" (a containment request carries none), and
+    `verify` is False when Scylla checks the candidates itself (a request that leaves it to the
+    index node carries none); each is None when the body omits it. The raw body stays in `body`.
     """
     cursor: str | None = None
     order: str | None = None
     kind: str | None = None
+    verify: bool | None = None
 
     @classmethod
     def from_request(cls, request: Request) -> "ContainsRequest":
@@ -43,7 +45,7 @@ class ContainsRequest(Request):
         if not isinstance(fields, dict):
             fields = {}
         return cls(path=request.path, body=request.body, cursor=fields.get("cursor"), order=fields.get("order"),
-                   kind=fields.get("kind"))
+                   kind=fields.get("kind"), verify=fields.get("verify"))
 
 
 @dataclass
