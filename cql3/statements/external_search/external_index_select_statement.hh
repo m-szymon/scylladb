@@ -11,6 +11,7 @@
 #include "cql3/statements/external_search/external_search_plan.hh"
 #include "cql3/statements/external_search/filter.hh"
 #include "cql3/statements/select_statement.hh"
+#include "exceptions/exceptions.hh"
 #include "vector_search/hybrid_search.hh"
 
 #include <vector>
@@ -51,6 +52,11 @@ public:
 
     external_index_select_statement(std::vector<search_source> sources, external_search::prepared_filter prepared_filter,
             external_statement_args args);
+
+    /// The rejection of a query sent with a paging state. An external-search query is not paged, so
+    /// the state was saved by another query, and running the search would return the full result
+    /// again as if it were the next page. `served_by` names the index, `query_kind` the search.
+    static exceptions::invalid_request_exception cannot_continue_paged_query(std::string_view served_by, std::string_view query_kind);
 
 private:
     /// Base-table rows read for the keys the searches returned, together with the command they were

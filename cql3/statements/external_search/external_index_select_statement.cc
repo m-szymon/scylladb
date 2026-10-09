@@ -19,6 +19,8 @@
 #include "vector_search/hybrid_search.hh"
 #include "cql3/statements/index_latency.hh"
 #include "db/consistency_level_validations.hh"
+#include "index/fulltext_index.hh"
+#include "index/vector_index.hh"
 #include "query/query_result_merger.hh"
 #include "service/storage_proxy.hh"
 #include "utils/result_loop.hh"
@@ -88,6 +90,20 @@ std::string_view query_kind_name(const std::vector<search_source>& sources) {
         return "Vector search";
     case search_family::bm25:
         return "Full-text search";
+    }
+    std::unreachable();
+}
+
+/// The index that serves the query, as the paging error names it.
+sstring served_by(const std::vector<search_source>& sources) {
+    if (is_hybrid(sources)) {
+        return "several external indexes";
+    }
+    switch (sources.front().family) {
+    case search_family::ann:
+        return seastar::format("a {} index", secondary_index::vector_index::INDEX_TYPE_NAME);
+    case search_family::bm25:
+        return seastar::format("a {} index", secondary_index::fulltext_index::INDEX_TYPE_NAME);
     }
     std::unreachable();
 }
@@ -350,6 +366,14 @@ void external_index_select_statement::setup_execute(service::query_state& state,
     update_stats();
 }
 
+exceptions::invalid_request_exception external_index_select_statement::cannot_continue_paged_query(
+        std::string_view served_by, std::string_view query_kind) {
+    return exceptions::invalid_request_exception(seastar::format(
+            "Cannot continue paged query: this query is served by {}, and {} queries are not paged. "
+            "Please retry the query from the beginning.",
+            served_by, query_kind));
+}
+
 void external_index_select_statement::maybe_add_paging_warning(
         const ::shared_ptr<cql_transport::messages::result_message>& result, const query_options& options, uint64_t limit) const {
     auto page_size = options.get_page_size();
@@ -360,6 +384,10 @@ void external_index_select_statement::maybe_add_paging_warning(
 
 future<::shared_ptr<cql_transport::messages::result_message>> external_index_select_statement::do_execute(
         query_processor& qp, service::query_state& state, const query_options& options) const {
+    if (options.get_paging_state()) {
+        co_await coroutine::return_exception(cannot_continue_paged_query(served_by(_sources), query_kind_name(_sources)));
+    }
+
     auto limit = get_limit(options, _limit);
 
     auto result = co_await measure_index_latency(
