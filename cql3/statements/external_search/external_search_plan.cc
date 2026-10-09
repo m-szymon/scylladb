@@ -39,6 +39,9 @@ secondary_index::index index_for(functions::search_family family, data_dictionar
         return ann_search::index_for(db, schema, column);
     case functions::search_family::bm25:
         return bm25_search::index_for(db, schema, column);
+    case functions::search_family::pattern:
+        // No search function is of this family.
+        break;
     }
     std::unreachable();
 }
@@ -66,6 +69,9 @@ sstring no_search_message(const functions::external_search_function& fun, search
     case functions::search_family::bm25:
         return seastar::format("{}() in {} must match a BM25 search in ORDER BY, with the same column and search term; "
                 "ORDER BY has no BM25 search", clause == search_clause::restrictions ? "BM25" : fun.display_name(), clause_name(clause));
+    case functions::search_family::pattern:
+        // No search function is of this family.
+        break;
     }
     std::unreachable();
 }
@@ -80,6 +86,9 @@ sstring column_mismatch_message(const functions::external_search_function& fun, 
         return seastar::format("{}() in {} must match a BM25 search in ORDER BY, with the same column and search term; "
                 "ORDER BY has no BM25 search on column {}", clause == search_clause::restrictions ? "BM25" : fun.display_name(),
                 clause_name(clause), column.name_as_cql_string());
+    case functions::search_family::pattern:
+        // No search function is of this family.
+        break;
     }
     std::unreachable();
 }
@@ -116,6 +125,9 @@ sstring query_value_mismatch_message(functions::search_family family, std::strin
                 ? seastar::format("{}() in ORDER BY must use the same search term as the other BM25 calls on the same column", function_name)
                 : seastar::format("{}() in {} must match a BM25 search in ORDER BY, with the same column and search term; "
                         "the search term differs", clause == search_clause::restrictions ? "BM25" : function_name, clause_name(clause));
+    case functions::search_family::pattern:
+        // No search function is of this family.
+        break;
     }
     std::unreachable();
 }
@@ -284,6 +296,9 @@ void external_search_plan::check_restrictions(const restrictions::select_restric
 
     auto& source = _sources.front();
     switch (source.family) {
+    case functions::search_family::pattern:
+        // No search function introduces one, so the plan runs none; see pattern_search.
+        break;
     case functions::search_family::ann:
         // Its relations were rejected above.
         return;

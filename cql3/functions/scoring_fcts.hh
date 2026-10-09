@@ -54,7 +54,10 @@ bool is_ann_function_name(const function_name& name);
 /// The family of external search functions a function belongs to: the vector search family (ANN) or
 /// the full-text search family (BM25). The family decides which index answers the search and what the
 /// second argument is: a query vector for ANN, a search term for BM25.
-enum class search_family { ann, bm25 };
+///
+/// A pattern search is introduced by a LIKE on a pattern-indexed column, not by a function, so no
+/// function is of the pattern family; it is here so that a statement can run it like the others.
+enum class search_family { ann, bm25, pattern };
 
 /// Which value a search function returns.
 enum class search_value {

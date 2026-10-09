@@ -12,6 +12,7 @@
 #include "cql3/statements/strong_consistency/statement_helpers.hh"
 #include "cql3/statements/select_statement.hh"
 #include "cql3/statements/external_search/external_index_select_statement.hh"
+#include "cql3/statements/external_search/pattern_search.hh"
 #include "cql3/statements/index_latency.hh"
 #include "cql3/expr/expression.hh"
 #include "cql3/expr/evaluate.hh"
@@ -2223,6 +2224,17 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
     auto restrictions = prepare_restrictions(db, schema, ctx, selection, _parameters->allow_filtering() || is_external_search,
             restrictions::check_indexes(!_parameters->is_mutation_fragments()), _pinned_plan);
 
+    // A LIKE on a pattern-indexed column is a search too, but the WHERE clause introduces it, and it
+    // runs alone.
+    std::optional<search_source> pattern_source;
+    if (auto pattern_index = pattern_search::index_for(db, schema, *restrictions, _pinned_plan.has_value())) {
+        if (is_external_search) {
+            throw exceptions::invalid_request_exception("A LIKE on a pattern-indexed column cannot be combined with ANN or BM25 in the same query");
+        }
+        pattern_source = pattern_search::source_for(std::move(*pattern_index), *schema, *restrictions, !_parameters->orderings().empty());
+    }
+    const bool runs_external_search = is_external_search || pattern_source.has_value();
+
     plan.check_restrictions(*restrictions);
 
     if (_parameters->is_distinct()) {
@@ -2233,7 +2245,7 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
 
     auto orderings = _parameters->orderings();
 
-    if (!orderings.empty() && !is_external_search) {
+    if (!orderings.empty() && !runs_external_search) {
         std::visit([&](auto&& ordering) {
             using T = std::decay_t<decltype(ordering)>;
             if constexpr (!std::is_same_v<T, raw::select_statement::scoring_function_ordering>) {
@@ -2248,7 +2260,7 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
     }
 
     std::vector<sstring> warnings;
-    if (!is_external_search) {
+    if (!runs_external_search) {
         check_needs_filtering(*restrictions, cfg.strict_allow_filtering(), warnings);
         ensure_filtering_columns_retrieval(db, *selection, *restrictions);
     }
@@ -2351,8 +2363,8 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
                 prepare_limit(db, ctx, _per_partition_limit),
                 stats,
                 std::move(prepared_attrs));
-    } else if (is_external_search) {
-        stmt = external_index_select_statement::prepare(plan.sources(), external_statement_args{
+    } else if (runs_external_search) {
+        stmt = external_index_select_statement::prepare(pattern_source ? std::vector{std::move(*pattern_source)} : plan.sources(), external_statement_args{
                 .schema = schema,
                 .bound_terms = ctx.bound_variables_size(),
                 .parameters = _parameters,

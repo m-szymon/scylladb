@@ -55,6 +55,9 @@ const function_name& score_function_name(search_family family) {
         return ANN_SCORE_FUNCTION_NAME;
     case search_family::bm25:
         return BM25_SCORE_FUNCTION_NAME;
+    case search_family::pattern:
+        // No search function is of this family.
+        break;
     }
     std::unreachable();
 }
