@@ -61,6 +61,8 @@ std::optional<sstring> to_multi_column_op_string(expr::oper_t op) {
     }
 }
 
+} // anonymous namespace
+
 rjson::value value_to_json(const data_type& type, const raw_value& val) {
     if (val.is_null()) {
         return rjson::null_value();
@@ -83,6 +85,8 @@ rjson::value value_to_json(const data_type& type, const raw_value& val) {
     auto json_str = to_json_string(*base_type, to_bytes(val.view()));
     return rjson::parse(json_str);
 }
+
+namespace {
 
 rjson::value lhs_to_json(const expr::column_value& col) {
     return rjson::from_string(col.col->name_as_text());
