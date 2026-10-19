@@ -408,6 +408,19 @@ def test_create_pattern_index_warns_about_like(cql, test_keyspace):
         assert "Every LIKE on column title will be served by this pattern index" in pattern_warnings[0]
 
 
+def test_create_ordered_pattern_index_warns_about_its_own_rules(cql, test_keyspace):
+    """An index with order_by orders and pages its LIKE queries, and its warning says so rather than
+    calling them unpaged and unordered."""
+    schema = 'p int primary key, title text, created bigint'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        result = cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': 'created'}}")
+        pattern_warnings = [w for w in result.response_future.warnings or [] if "pattern index" in w]
+        assert len(pattern_warnings) == 1
+        assert "a range on created" in pattern_warnings[0]
+        assert "unless it is paged" in pattern_warnings[0]
+        assert "not paged" not in pattern_warnings[0]
+
+
 def test_create_existing_pattern_index_if_not_exists_does_not_warn(cql, test_keyspace):
     """CREATE INDEX IF NOT EXISTS on an existing pattern index changes nothing, so it does not warn."""
     schema = 'p int primary key, title text'
