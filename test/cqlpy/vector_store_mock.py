@@ -57,6 +57,36 @@ class HighlightResponse:
 
 
 @dataclass
+class LikeRequest(Request):
+    """A `/like` request with the paging, ordering and verification fields of its body picked out.
+
+    `cursor` is the opaque string a previous reply's `next_cursor` handed back, `order` is "asc" or
+    "desc", the bounds are the `{"value", "inclusive"}` objects of a range on the ordered column, and
+    `verify` is False when ScyllaDB checks the candidates itself (a request that leaves it to the
+    index node carries none); each is None when the body omits it. The raw body stays in `body`.
+    """
+    pattern: str | None = None
+    limit: int | None = None
+    cursor: str | None = None
+    order: str | None = None
+    min_sort_value: dict | None = None
+    max_sort_value: dict | None = None
+    verify: bool | None = None
+
+    @classmethod
+    def from_request(cls, request: Request) -> "LikeRequest":
+        try:
+            fields = json.loads(request.body)
+        except ValueError:
+            fields = {}
+        if not isinstance(fields, dict):
+            fields = {}
+        return cls(path=request.path, body=request.body, pattern=fields.get("pattern"), limit=fields.get("limit"),
+                   cursor=fields.get("cursor"), order=fields.get("order"), min_sort_value=fields.get("min_sort_value"),
+                   max_sort_value=fields.get("max_sort_value"), verify=fields.get("verify"))
+
+
+@dataclass
 class LikeResponse:
     """The reply names the key columns of the queried table, so the default, which names none, fits no table.
 
@@ -72,7 +102,8 @@ class VectorStoreMock:
         self._ann_requests: list[Request] = []
         self._bm25_requests: list[Request] = []
         self._highlight_requests: list[Request] = []
-        self._like_requests: list[Request] = []
+        self._like_requests: list[LikeRequest] = []
+        self._like_responses: list[LikeResponse] = []
         self._status_requests: list[Request] = []
         self._lock = threading.Lock()
         self._next_ann_response = Response()
@@ -108,7 +139,7 @@ class VectorStoreMock:
             return self._highlight_requests.copy()
 
     @property
-    def like_requests(self) -> list[Request]:
+    def like_requests(self) -> list[LikeRequest]:
         with self._lock:
             return self._like_requests.copy()
 
@@ -145,6 +176,15 @@ class VectorStoreMock:
     def set_next_like_response(self, status: int, body: str) -> None:
         with self._lock:
             self._next_like_response = LikeResponse(status=status, body=body)
+            self._like_responses = []
+
+    def set_like_responses(self, responses: list[tuple[int, str]]) -> None:
+        """One response per request, in order, for a query that asks more than once -- a paged one.
+        Once the list runs out the last one is repeated, so a test that gets the page count wrong
+        fails on the rows rather than on a hang."""
+        with self._lock:
+            self._like_responses = [LikeResponse(status=s, body=b) for s, b in responses]
+            self._next_like_response = self._like_responses[-1]
 
     def set_next_status_response(self, status: int, body: str) -> None:
         with self._lock:
@@ -169,6 +209,7 @@ class VectorStoreMock:
             self._bm25_responses_by_index.clear()
             self._next_highlight_response = HighlightResponse()
             self._next_like_response = LikeResponse()
+            self._like_responses = []
             self._next_status_response = Response(status=200, body='"SERVING"')
             self._index_status_responses.clear()
 
@@ -199,8 +240,8 @@ class VectorStoreMock:
 
     def _handle_like(self, request: Request, send_response: Callable[[LikeResponse], None]) -> None:
         with self._lock:
-            self._like_requests.append(request)
-            response = self._next_like_response
+            self._like_requests.append(LikeRequest.from_request(request))
+            response = self._like_responses.pop(0) if self._like_responses else self._next_like_response
         send_response(response)
 
     def _handle_status(self, request: Request, send_response: Callable[[Response], None]) -> None:

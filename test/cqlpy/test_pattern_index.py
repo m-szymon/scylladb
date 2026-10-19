@@ -68,7 +68,7 @@ def test_create_pattern_index_on_key_or_static_column_fails(cql, test_keyspace):
 
 
 def test_create_pattern_index_with_valid_options(cql, test_keyspace):
-    """case_sensitive, the only option, takes a boolean in any letter case."""
+    """case_sensitive takes a boolean in any letter case."""
     schema = 'p int primary key, title text'
     with new_test_table(cql, test_keyspace, schema) as table:
         for value in ['true', 'false', 'TRUE', 'False']:
@@ -453,3 +453,154 @@ def test_paging_filtered_like_then_create_pattern_index_prepared(cql, test_keysp
         cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index'")
         with pytest.raises(InvalidRequest, match="Cannot continue paged query: this query is served by a pattern index"):
             cql.execute(stmt, paging_state=r.paging_state)
+
+
+###############################################################################
+# The options of an ordered pattern index and of the index node's segments:
+# order_by, min_gram and max_gram, segment_rows, rewrite and verify_candidates.
+# Queries on an ordered index are covered by test_pattern_ordering_with_mock.py
+# and test_pattern_verification_with_mock.py.
+###############################################################################
+
+
+def test_create_pattern_index_with_all_options(cql, test_keyspace):
+    """Every option is accepted together and stored as given, for the index node to read."""
+    schema = 'p int primary key, title text, registered_at timestamp'
+    options = {
+        'case_sensitive': 'true', 'min_gram': '2', 'max_gram': '5', 'order_by': 'registered_at',
+        'segment_rows': '1000', 'rewrite': 'false', 'verify_candidates': 'scylla',
+    }
+    with new_test_table(cql, test_keyspace, schema) as table:
+        index_name = unique_name()
+        options_cql = ', '.join(f"'{k}': '{v}'" for k, v in options.items())
+        cql.execute(f"CREATE CUSTOM INDEX {index_name} ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{{options_cql}}}")
+        stored = cql.execute(
+            f"SELECT options FROM system_schema.indexes WHERE keyspace_name = '{test_keyspace}' "
+            f"AND table_name = '{table.split('.')[1]}' AND index_name = '{index_name}'").one().options
+        for k, v in options.items():
+            assert stored[k] == v
+
+
+@pytest.mark.parametrize("option, value", [
+    ("min_gram", "1"), ("min_gram", "3"), ("max_gram", "8"),
+    ("segment_rows", "0"), ("segment_rows", "200000"),
+    ("rewrite", "true"), ("rewrite", "FALSE"),
+    ("verify_candidates", "index"),
+])
+def test_create_pattern_index_with_valid_option_value(cql, test_keyspace, option, value):
+    """segment_rows takes 0 for no cap; verify_candidates = 'index' needs nothing else."""
+    schema = 'p int primary key, title text'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'{option}': '{value}'}}")
+
+
+@pytest.mark.parametrize("option, value, error", [
+    ("min_gram", "0", "out of valid range"),
+    ("min_gram", "9", "out of valid range"),
+    ("max_gram", "-1", "out of valid range"),
+    ("max_gram", "three", "is not an integer"),
+    ("max_gram", "3.5", "is not an integer"),
+    ("segment_rows", "-1", "must be a number of rows"),
+    ("segment_rows", "x", "must be a number of rows"),
+    ("segment_rows", "", "must be a number of rows"),
+    ("segment_rows", "10rows", "must be a number of rows"),
+    ("rewrite", "maybe", "Invalid value in option 'rewrite'"),
+    ("verify_candidates", "both", "Invalid value in option 'verify_candidates'"),
+    ("order_by", "", "must name a column"),
+])
+def test_create_pattern_index_with_bad_option_value_fails_for_new_options(cql, test_keyspace, option, value, error):
+    """Each option validates its value."""
+    schema = 'p int primary key, title text'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        with pytest.raises(InvalidRequest, match=error):
+            cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'{option}': '{value}'}}")
+
+
+def test_create_pattern_index_min_gram_above_max_gram_fails(cql, test_keyspace):
+    """The two gram lengths must be consistent, whether both or only one is given."""
+    schema = 'p int primary key, title text'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        with pytest.raises(InvalidRequest, match=r"min_gram \(4\) must not be greater than max_gram \(3\)"):
+            cql.execute(
+                f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' "
+                f"WITH OPTIONS = {{'min_gram': '4', 'max_gram': '3'}}"
+            )
+        # Only min_gram given: compared against the default max_gram of 3.
+        with pytest.raises(InvalidRequest, match=r"min_gram \(4\) must not be greater than max_gram \(3\)"):
+            cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'min_gram': '4'}}")
+        # Equal is fine.
+        cql.execute(
+            f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' "
+            f"WITH OPTIONS = {{'min_gram': '3', 'max_gram': '3'}}"
+        )
+
+
+def test_create_pattern_index_with_poc_options_fails(cql, test_keyspace):
+    """The proof of concept's placeholder options are gone, and are unknown like any other."""
+    schema = 'p int primary key, title text'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        for option in ['poc_option_1', 'poc_option_2', 'poc_option_3', 'poc_option_4']:
+            with pytest.raises(InvalidRequest, match=f"Unsupported option {option} for pattern index"):
+                cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'{option}': 'x'}}")
+
+
+def test_order_by_accepts_integer_and_time_columns(cql, test_keyspace):
+    """The index node keeps the sort value as a fixed-width integer, so these are the types it can order."""
+    column_types = ["tinyint", "smallint", "int", "bigint", "timestamp", "date", "time"]
+    schema = 'p int primary key, title text, ' + ', '.join(f'v_{t} {t}' for t in column_types)
+    with new_test_table(cql, test_keyspace, schema) as table:
+        for t in column_types:
+            index_name = unique_name()
+            cql.execute(f"CREATE CUSTOM INDEX {index_name} ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': 'v_{t}'}}")
+            cql.execute(f"DROP INDEX {test_keyspace}.{index_name}")
+
+
+def test_order_by_rejects_other_column_types(cql, test_keyspace):
+    """A column with no order-preserving fixed-width integer image is refused at creation; the index
+    node applies the same rule, and the two must agree."""
+    column_types = ["text", "boolean", "float", "double", "decimal", "varint", "uuid", "timeuuid", "blob"]
+    schema = 'p int primary key, title text, ' + ', '.join(f'v_{t} {t}' for t in column_types)
+    with new_test_table(cql, test_keyspace, schema) as table:
+        for t in column_types:
+            with pytest.raises(InvalidRequest, match="only integer and time columns can be ordered by"):
+                cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': 'v_{t}'}}")
+        # The indexed column itself is text, so it cannot be its own sort column either.
+        with pytest.raises(InvalidRequest, match="only integer and time columns can be ordered by"):
+            cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': 'title'}}")
+
+
+def test_order_by_must_name_a_column_of_the_table(cql, test_keyspace):
+    """A sort column that does not exist is refused at creation. Accepting it would leave the
+    index answering in its own order while the query claims another."""
+    schema = 'p int primary key, title text'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        with pytest.raises(InvalidRequest, match="no_such_column, which is not in the table"):
+            cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': 'no_such_column'}}")
+
+
+def test_order_by_accepts_key_columns_and_rejects_a_static_column(cql, test_keyspace):
+    """The sort value may come from the primary key or a regular column, but not from a static one."""
+    schema = 'p int, c bigint, s int static, title text, PRIMARY KEY (p, c)'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        for column in ['p', 'c']:
+            index_name = unique_name()
+            cql.execute(f"CREATE CUSTOM INDEX {index_name} ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': '{column}'}}")
+            cql.execute(f"DROP INDEX {test_keyspace}.{index_name}")
+        with pytest.raises(InvalidRequest, match="(?i)cannot order by column s, which is a static column"):
+            cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': 's'}}")
+
+
+def test_verify_candidates_scylla_needs_a_case_sensitive_ordered_index(cql, test_keyspace):
+    """ScyllaDB's LIKE is case-sensitive, and a page it leaves short resumes from a cursor only an
+    ordered index reports, so asking ScyllaDB to check anything else is refused when the index is
+    created rather than silently ignored."""
+    schema = 'p int primary key, title text, registered_at timestamp'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        with pytest.raises(InvalidRequest, match="needs a case-sensitive index"):
+            cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = "
+                        "{'order_by': 'registered_at', 'case_sensitive': 'false', 'verify_candidates': 'scylla'}")
+        with pytest.raises(InvalidRequest, match="needs an 'order_by' option"):
+            cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = "
+                        "{'verify_candidates': 'scylla'}")
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = "
+                    "{'order_by': 'registered_at', 'case_sensitive': 'true', 'verify_candidates': 'scylla'}")
