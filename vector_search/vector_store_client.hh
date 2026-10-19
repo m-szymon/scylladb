@@ -210,6 +210,40 @@ public:
     auto like(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit, abort_source& as)
             -> future<std::expected<primary_keys, like_error>>;
 
+    /// The direction an ordered pattern search walks the index's `order_by` column in.
+    enum class like_order {
+        ascending,
+        descending,
+    };
+    /// One end of a range on an ordered index's sort column: the bounding value in the JSON
+    /// encoding of the column's type (the one the filtering API uses), and whether the bound
+    /// includes it. The index node turns it into its own sort key, so nothing here knows how the
+    /// node orders.
+    struct sort_bound {
+        rjson::value value;
+        bool inclusive;
+    };
+    /// A page of an ordered pattern search: the keys, and where the next page resumes.
+    /// `next_cursor` is empty when the index is unordered, or when the page exhausted the matches.
+    /// It is the index node's own position, passed back to it unchanged and never parsed here.
+    struct like_page_result {
+        primary_keys keys;
+        std::optional<sstring> next_cursor;
+        /// Whether every key is a match. False only when the request declined verification and
+        /// the index had candidates to check: the keys are then rows holding every gram of the
+        /// keyword, and the caller applies the pattern to the rows it reads.
+        bool verified = true;
+    };
+    /// Like `like()`, for an index created with an `order_by` column: the keys come in `order`
+    /// (descending when none is given), restricted to the sort values between the bounds, and the
+    /// page reports where the next one resumes; `cursor` carries that back to read it.
+    ///
+    /// `verify` false tells the index not to check its candidates against the stored value: the
+    /// page is then flagged unverified, for the caller to check on the rows it reads anyway.
+    auto like_page(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit,
+            std::optional<sstring> cursor, std::optional<like_order> order, std::optional<sort_bound> min_sort_value,
+            std::optional<sort_bound> max_sort_value, bool verify, abort_source& as) -> future<std::expected<like_page_result, like_error>>;
+
     /// Request a fragment of each of the given documents, with the terms of `fts_query` marked.
     ///
     /// The index is asked because choosing which of a document's terms matter needs the corpus

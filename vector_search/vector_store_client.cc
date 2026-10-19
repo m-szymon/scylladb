@@ -354,6 +354,69 @@ auto read_like_json(rjson::value const& json, schema_ptr const& schema) -> std::
     return read_scored_primary_keys_json(json, schema, std::nullopt);
 }
 
+using like_order = vector_search::vector_store_client::like_order;
+using sort_bound = vector_search::vector_store_client::sort_bound;
+
+auto sort_bound_json(sort_bound const& bound) -> rjson::value {
+    auto json = rjson::empty_object();
+    rjson::add(json, "value", rjson::copy(bound.value));
+    rjson::add(json, "inclusive", rjson::value(bound.inclusive));
+    return json;
+}
+
+auto write_like_page_json(query_string pattern, limit limit, std::optional<sstring> const& cursor, std::optional<like_order> order,
+        std::optional<sort_bound> const& min_sort_value, std::optional<sort_bound> const& max_sort_value, bool verify) -> json_content {
+    auto body = rjson::empty_object();
+    rjson::add(body, "pattern", rjson::from_string(pattern));
+    rjson::add(body, "limit", static_cast<uint64_t>(limit));
+    if (cursor) {
+        rjson::add(body, "cursor", rjson::from_string(*cursor));
+    }
+    if (order) {
+        rjson::add(body, "order", rjson::from_string(*order == like_order::ascending ? "asc" : "desc"));
+    }
+    if (min_sort_value) {
+        rjson::add(body, "min_sort_value", sort_bound_json(*min_sort_value));
+    }
+    if (max_sort_value) {
+        rjson::add(body, "max_sort_value", sort_bound_json(*max_sort_value));
+    }
+    // Verification is the index node's default, so only declining it is spelled out.
+    if (!verify) {
+        rjson::add(body, "verify", rjson::value(false));
+    }
+    return rjson::print(body);
+}
+
+/// Whether the page's keys are matches rather than candidates. Absent means verified, which is
+/// what an index node that never heard of the flag would have done.
+auto read_verified_json(rjson::value const& json) -> std::expected<bool, like_error> {
+    auto const* verified_json = rjson::find(json, "verified");
+    if (verified_json == nullptr || verified_json->IsNull()) {
+        return true;
+    }
+    if (!verified_json->IsBool()) {
+        vslogger.error("Vector Store returned invalid JSON: 'verified' is not a boolean");
+        return std::unexpected{service_reply_format_error{}};
+    }
+    return verified_json->GetBool();
+}
+
+/// The cursor a page reports, if any. Absent is normal -- an unordered index never reports one --
+/// so only a present-but-wrong value is an error. The string is kept as it came: it is the index
+/// node's to interpret.
+auto read_next_cursor_json(rjson::value const& json) -> std::expected<std::optional<sstring>, like_error> {
+    auto const* cursor_json = rjson::find(json, "next_cursor");
+    if (cursor_json == nullptr || cursor_json->IsNull()) {
+        return std::optional<sstring>{};
+    }
+    if (!cursor_json->IsString()) {
+        vslogger.error("Vector Store returned invalid JSON: 'next_cursor' is not a string");
+        return std::unexpected{service_reply_format_error{}};
+    }
+    return std::optional<sstring>{sstring(cursor_json->GetString(), cursor_json->GetStringLength())};
+}
+
 auto write_highlight_json(query_string query, documents docs) -> json_content {
     auto quoted_docs = docs | std::views::transform([](auto const& doc) {
         return rjson::quote_json_string(doc);
@@ -675,6 +738,36 @@ struct vector_store_client::impl {
         }
     }
 
+    auto like_page(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit,
+            std::optional<sstring> cursor, std::optional<like_order> order, std::optional<sort_bound> min_sort_value,
+            std::optional<sort_bound> max_sort_value, bool verify, abort_source& as) -> future<std::expected<like_page_result, like_error>> {
+        auto content = co_await post_to_index("like", format("/api/v1/indexes/{}/{}/like", keyspace, name),
+                write_like_page_json(std::move(pattern), limit, cursor, order, min_sort_value, max_sort_value, verify), as);
+        if (!content) {
+            co_return std::unexpected{content.error()};
+        }
+
+        try {
+            auto json = rjson::parse(std::move(*content));
+            auto keys = read_like_json(json, schema);
+            if (!keys) {
+                co_return std::unexpected{keys.error()};
+            }
+            auto next_cursor = read_next_cursor_json(json);
+            if (!next_cursor) {
+                co_return std::unexpected{next_cursor.error()};
+            }
+            auto verified = read_verified_json(json);
+            if (!verified) {
+                co_return std::unexpected{verified.error()};
+            }
+            co_return like_page_result{std::move(*keys), std::move(*next_cursor), *verified};
+        } catch (const rjson::error& e) {
+            vslogger.error("Vector Store returned invalid JSON: {}", e.what());
+            co_return std::unexpected{service_reply_format_error{}};
+        }
+    }
+
     auto highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents docs, abort_source& as)
             -> future<std::expected<highlights, fts_error>> {
         auto documents_sent = docs.size();
@@ -829,6 +922,13 @@ auto vector_store_client::bm25(keyspace_name keyspace, index_name name, schema_p
 auto vector_store_client::like(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit, abort_source& as)
         -> future<std::expected<primary_keys, like_error>> {
     return _impl->like(std::move(keyspace), std::move(name), schema, std::move(pattern), limit, as);
+}
+
+auto vector_store_client::like_page(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit,
+        std::optional<sstring> cursor, std::optional<like_order> order, std::optional<sort_bound> min_sort_value,
+        std::optional<sort_bound> max_sort_value, bool verify, abort_source& as) -> future<std::expected<like_page_result, like_error>> {
+    return _impl->like_page(std::move(keyspace), std::move(name), schema, std::move(pattern), limit, std::move(cursor), order,
+            std::move(min_sort_value), std::move(max_sort_value), verify, as);
 }
 
 auto vector_store_client::highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents documents, abort_source& as)
