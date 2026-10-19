@@ -78,6 +78,9 @@ public:
 public:
     void set_paging_state(lw_shared_ptr<const service::pager::paging_state> paging_state);
     void maybe_set_paging_state(lw_shared_ptr<const service::pager::paging_state> paging_state);
+    /// Says this is the last page. A statement that reuses its selection's metadata across pages
+    /// has to say so explicitly, or an earlier page's state would be served again as the last one's.
+    void clear_paging_state();
 
     void set_skip_metadata();
 
