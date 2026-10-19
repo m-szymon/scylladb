@@ -61,6 +61,29 @@ The pattern is evaluated, a null one rejected, and posted with the `LIMIT` to `/
 with clustering keys the rows come back in the order the base-table reads deliver them, not in the
 index's order.
 
+## Ordered search
+
+An index created with `order_by` is served by `ordered_pattern_select_statement`, chosen in
+`select_statement::prepare` where an unordered index would get its `search_source`. It derives from
+`external_index_select_statement` for the base-table read only and replaces `do_execute`:
+
+- `ORDER BY` may name the `order_by` column, and the `WHERE` clause may add a range on it. The
+  coordinator's own ordering checks are skipped for an external search, so the statement validates
+  both itself. The range goes to the index node as typed values (`min_sort_value`,
+  `max_sort_value`), which the node encodes; ScyllaDB never sees the node's sort key.
+- The node walks its matches in that order and reports `next_cursor`, an opaque string that names
+  the last row's sort value and primary key. It travels in the driver's paging state
+  (`paging_state::get_index_cursor()`, an optional field of the IDL), so a page resumes there and
+  rows tied on the sort value are neither skipped nor repeated.
+- A paged query needs no LIMIT and asks for at most 1000 keys a page; an unpaged one needs a LIMIT of
+  at most 1000. The check is made at execution, because only then is it known whether the query is
+  paged.
+- With `verify_candidates = 'scylla'` the request says `verify: false`, the node may return
+  candidates and says so in `verified: false`, and the statement drops the rows `like_matcher` does
+  not match, on the target column it fetched for that. A page left short is topped up from the
+  cursor up to three times when paged, until full when not. The default leaves the check on the
+  node, which measured the same capacity and a better p99.
+
 ## Options
 
 The only option is `case_sensitive` (default true, matching `LIKE`). With `false`, the index node

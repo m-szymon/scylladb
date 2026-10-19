@@ -442,12 +442,13 @@ Example::
    ``LIKE`` on the column is served by the index, even with ``ALLOW FILTERING``:
 
    * Queries that worked by filtering start failing. The ``LIKE`` must be the only restriction in the
-     ``WHERE`` clause, and the query needs a ``LIMIT`` of at most 1000, so for example a ``LIKE``
-     together with a restriction on the partition key, or a ``LIKE`` without a ``LIMIT``, is rejected.
+     ``WHERE`` clause (on an index with ``order_by``, a range on that column may join it), and the query
+     needs a ``LIMIT`` of at most 1000 unless it is paged on an index with ``order_by``, so for example a
+     ``LIKE`` together with a restriction on the partition key is rejected.
    * Queries that still succeed can return different rows, without any error. The index is eventually
-     consistent, so a recent write may be missed, and the rows are neither paged nor ordered. With
-     ``'case_sensitive': 'false'``, matching ignores letter case, so a ``LIKE`` returns rows that a
-     filtered ``LIKE`` does not.
+     consistent, so a recent write may be missed, and unless the index has ``order_by`` the rows
+     are neither paged nor ordered. With ``'case_sensitive': 'false'``, matching ignores letter case,
+     so a ``LIKE`` returns rows that a filtered ``LIKE`` does not.
    * When the index node is unavailable, every ``LIKE`` on the column fails.
 
    ``CREATE INDEX`` returns a warning that summarizes these changes. To restore filtered ``LIKE``, drop the
@@ -456,13 +457,41 @@ Example::
 
 The following options are supported for pattern indexes:
 
-+--------------------+---------------------------------------------------------------------------------------+-------------------+
-| Option             | Description                                                                           | Default Value     |
-+====================+=======================================================================================+===================+
-| ``case_sensitive`` | Whether matching distinguishes letter case, as ``LIKE`` does. With ``false`` both the | ``true``          |
-|                    | indexed values and the patterns are lowercased, so ``'%ab-%'`` matches                |                   |
-|                    | ``AB-1024-XL``. Supported values: ``true``, ``false``, in any letter case.            |                   |
-+--------------------+---------------------------------------------------------------------------------------+-------------------+
++-------------------------+----------------------------------------------------------------------------------+------------+
+| Option                  | Description                                                                      | Default    |
++=========================+==================================================================================+============+
+| ``case_sensitive``      | Whether matching distinguishes letter case, as ``LIKE`` does. With ``false``     | ``true``   |
+|                         | both the indexed values and the patterns are lowercased, so ``'%ab-%'`` matches  |            |
+|                         | ``AB-1024-XL``. Supported values: ``true``, ``false``, in any letter case.       |            |
++-------------------------+----------------------------------------------------------------------------------+------------+
+| ``min_gram``            | The length in characters of the shortest substring the index node indexes. A     | ``1``      |
+|                         | pattern whose literal part is shorter is refused. A positive integer up to 8.    |            |
++-------------------------+----------------------------------------------------------------------------------+------------+
+| ``max_gram``            | The length in characters of the longest indexed substring. A literal part up to  | ``3``      |
+|                         | this length is a single exact lookup; a longer one is answered from its          |            |
+|                         | substrings and checked. A positive integer up to 8, not smaller than             |            |
+|                         | ``min_gram``.                                                                    |            |
++-------------------------+----------------------------------------------------------------------------------+------------+
+| ``order_by``            | A column the index orders its results by: an integer, ``date``, ``time`` or      | none       |
+|                         | ``timestamp`` column of the table, regular or part of the primary key. With it,  |            |
+|                         | a pattern search may have ``ORDER BY`` on that column, a range on it, and        |            |
+|                         | paging; see :ref:`Pattern search queries <pattern-queries>`.                     |            |
++-------------------------+----------------------------------------------------------------------------------+------------+
+| ``segment_rows``        | For an index with ``order_by``: the most rows the index node keeps in one        | ``200000`` |
+|                         | internal segment, which keeps segments narrow along the ordered column so that a |            |
+|                         | later page costs what the first one does. ``0`` turns the cap off. The default   |            |
+|                         | applies to an index with ``order_by``; one without has no cap.                   |            |
++-------------------------+----------------------------------------------------------------------------------+------------+
+| ``rewrite``             | Whether the index node rewrites segments that span much more of the ordered      | ``true``   |
+|                         | column than their share of the rows, as an index created on an already loaded    |            |
+|                         | table has. Supported values: ``true``, ``false``. The default applies wherever   |            |
+|                         | there is a segment cap.                                                          |            |
++-------------------------+----------------------------------------------------------------------------------+------------+
+| ``verify_candidates``   | Who checks the candidate rows of a pattern whose literal part is longer than     | ``index``  |
+|                         | ``max_gram``: the index node against the value it stores (``index``), or         |            |
+|                         | ScyllaDB against the rows it reads anyway (``scylla``). ``scylla`` needs a case- |            |
+|                         | sensitive index with ``order_by``.                                               |            |
++-------------------------+----------------------------------------------------------------------------------+------------+
 
 .. _drop-index-statement:
 

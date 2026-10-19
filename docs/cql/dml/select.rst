@@ -678,9 +678,45 @@ The rules are:
 * A bind marker may stand for the pattern (``LIKE ?``). The pattern must not be null.
 * ``LIMIT`` is mandatory and must not exceed 1000. ``ORDER BY``, ``PER PARTITION LIMIT``, ``GROUP BY``,
   aggregation and any further ``WHERE`` restriction, including one on the partition key, are not
-  supported.
+  supported, unless the index was created with ``order_by`` (see below).
 * The query is served by the index even with ``ALLOW FILTERING``. When the index node is unavailable
   or does not support the pattern, the query fails.
+* The index node serves the patterns ``'%keyword%'``, ``'keyword%'`` and ``'%keyword'``, where the
+  keyword is at least ``min_gram`` characters long. ``\`` makes the next character literal, as in a
+  filtered ``LIKE``.
+
+Ordered pattern queries
+.......................
+
+An index created with the ``order_by`` option orders its matches by that column, and a query on it
+may also order, restrict and page by it:
+
+.. code-block::
+
+   ordered_pattern_query: SELECT ... FROM `table_name`
+                        :   WHERE `column_name` LIKE `pattern`
+                        :   [ AND `order_by_column` `range_operator` `value` ... ]
+                        :   [ ORDER BY `order_by_column` [ ASC | DESC ] ]
+                        :   [ LIMIT `integer` ]
+
+Example, for an index created with ``WITH OPTIONS = {'order_by': 'registered_at'}``::
+
+    SELECT id, nickname FROM users
+        WHERE nickname LIKE '%将军%' AND registered_at >= '2026-01-01'
+        ORDER BY registered_at DESC;
+
+The rules for such an index replace those above:
+
+* The rows come in the order of the ``order_by`` column, descending unless ``ORDER BY ... ASC`` asks
+  otherwise. ``ORDER BY`` can name only that column.
+* Besides the ``LIKE``, the ``WHERE`` clause may restrict the ``order_by`` column with ``<``, ``<=``,
+  ``>`` and ``>=``; no other restriction is supported. Bind markers may stand for the bounds.
+* A paged query (the drivers page by default) is paged by the index: each page resumes where the
+  previous one ended, and rows that share a value of the ordered column are neither skipped nor
+  repeated. It needs no ``LIMIT``; one, if given, caps the whole result. A page holds at most 1000 rows,
+  and may hold fewer than the page size, or none, while more follow: a client should keep reading until
+  the driver says there are no more pages.
+* A query that is not paged returns everything at once, so it needs a ``LIMIT`` of at most 1000.
 
 .. warning::
 

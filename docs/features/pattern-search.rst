@@ -71,10 +71,11 @@ For the option and its default, see
    * Queries that worked by filtering start failing. The ``LIKE`` must be the
      only restriction in the ``WHERE`` clause, and the query needs a ``LIMIT``
      of at most 1000, so for example a ``LIKE`` together with a restriction on
-     the partition key, or a ``LIKE`` without a ``LIMIT``, is rejected.
+     the partition key, or a ``LIKE`` without a ``LIMIT``, is rejected. An
+     index with ``order_by`` relaxes both; see `Ordering and Paging`_.
    * Queries that still succeed can return different rows, without any error.
      The index is eventually consistent, so a recent write may be missed, and
-     the rows are neither paged nor ordered. With
+     unless the index has ``order_by`` the rows are neither paged nor ordered. With
      ``'case_sensitive': 'false'``, matching ignores letter case, so a ``LIKE``
      returns rows that a filtered ``LIKE`` does not.
    * When the index node is unavailable, every ``LIKE`` on the column fails.
@@ -128,6 +129,9 @@ column from the index, even with ``ALLOW FILTERING``. The full rules are in
 Indexed vs. Filtered LIKE
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
+The indexed column of the table below describes an index without ``order_by``.
+One with ``order_by`` is also ordered and paged; see `Ordering and Paging`_.
+
 Without a pattern index, ``LIKE`` is a filter: ScyllaDB reads the rows and
 checks each value against the pattern, as described in
 :ref:`LIKE Operator <like-operator>`. On a column with a pattern index, the
@@ -174,6 +178,41 @@ filtered one as follows:
 | Failure              | Fails as any read does.                  | Also fails when the index node is unavailable or     |
 |                      |                                          | does not support the pattern.                        |
 +----------------------+------------------------------------------+------------------------------------------------------+
+
+Ordering and Paging
+-------------------
+
+A search box shows the newest matches first, a page at a time. An index
+created with the ``order_by`` option keeps its matches ordered by that column,
+which must be an integer, ``date``, ``time`` or ``timestamp`` column::
+
+    CREATE CUSTOM INDEX ON ks.users (nickname) USING 'pattern_index'
+        WITH OPTIONS = {'order_by': 'registered_at'};
+
+    SELECT user_id, nickname FROM ks.users
+        WHERE nickname LIKE '%将军%'
+        ORDER BY registered_at DESC;
+
+    SELECT user_id, nickname FROM ks.users
+        WHERE nickname LIKE '%将军%' AND registered_at < '2026-01-01'
+        ORDER BY registered_at DESC;
+
+* The rows come in the order of the ``order_by`` column, newest first unless
+  ``ORDER BY ... ASC`` asks otherwise.
+* A range on that column (``<``, ``<=``, ``>``, ``>=``) narrows the search.
+* The query is paged by the index, the way the drivers page every query: a
+  later page resumes where the previous one ended and costs about what the first
+  one did, and rows sharing a value of the ordered column are neither skipped
+  nor repeated. A paged query needs no ``LIMIT``; a query that is not paged needs
+  one of at most 1000.
+* A page may hold fewer rows than the page size, or none, while more follow.
+  Read until the driver reports no more pages.
+
+To keep a later page as cheap as the first, the index node keeps its internal
+segments narrow along the ordered column (``segment_rows``) and rewrites the
+wide ones an index created on an already loaded table starts with
+(``rewrite``). Both are on by default for an index with ``order_by``. The
+options are described in :ref:`Pattern Index <create-pattern-index-statement>`.
 
 Dropping a Pattern Index
 ------------------------
