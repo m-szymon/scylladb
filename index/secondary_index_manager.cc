@@ -38,10 +38,22 @@ index::index(const sstring& target_column, const index_metadata& im)
     : _im{im}
     , _target_type{cql3::statements::index_target::from_target_string(target_column)}
     , _target_column{cql3::statements::index_target::column_name_from_target_string(target_column)}
-    , _columns{secondary_index_manager::is_custom_index<vector_index>(im)
-            ? vector_index::get_all_target_columns(im.options().at(cql3::statements::index_target::target_option_name))
-            : std::vector<sstring>{_target_column}}
+    , _columns{dependent_columns(_target_column, im)}
 {}
+
+std::vector<sstring> index::dependent_columns(const sstring& target_column, const index_metadata& im) {
+    if (secondary_index_manager::is_custom_index<vector_index>(im)) {
+        return vector_index::get_all_target_columns(im.options().at(cql3::statements::index_target::target_option_name));
+    }
+    std::vector<sstring> columns{target_column};
+    // An ordered pattern index keeps its matches sorted by this column too.
+    if (secondary_index_manager::is_custom_index<pattern_index>(im)) {
+        if (auto order_by = pattern_index::order_by(im)) {
+            columns.push_back(std::move(*order_by));
+        }
+    }
+    return columns;
+}
 
 bool index::depends_on(const column_definition& cdef) const {
     return std::ranges::contains(_columns, cdef.name_as_text());

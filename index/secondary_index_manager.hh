@@ -66,6 +66,8 @@ class index {
     sstring _target_column;
     // All columns the index depends on.
     std::vector<sstring> _columns;
+
+    static std::vector<sstring> dependent_columns(const sstring& target_column, const index_metadata& im);
 public:
     index(const sstring& target_column, const index_metadata& im);
     bool depends_on(const column_definition& cdef) const;

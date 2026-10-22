@@ -603,6 +603,33 @@ def test_order_by_accepts_key_columns_and_rejects_a_static_column(cql, test_keys
             cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': 's'}}")
 
 
+def test_drop_order_by_column_of_pattern_index_fails(cql, test_keyspace):
+    """The column an index orders by cannot be dropped until the index is dropped: the index would
+    be left ordering by a column that no longer exists."""
+    schema = 'p int primary key, title text, created bigint, other bigint'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        index_name = unique_name()
+        cql.execute(f"CREATE CUSTOM INDEX {index_name} ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': 'created'}}")
+        with pytest.raises(InvalidRequest, match=f"Cannot drop column created from base table {table} because it has dependent indexes \\({index_name}\\)"):
+            cql.execute(f"ALTER TABLE {table} DROP created")
+        cql.execute(f"ALTER TABLE {table} DROP other")
+        cql.execute(f"DROP INDEX {test_keyspace}.{index_name}")
+        cql.execute(f"ALTER TABLE {table} DROP created")
+
+
+def test_rename_order_by_column_of_pattern_index_fails(cql, test_keyspace):
+    """A clustering column an index orders by cannot be renamed while the index exists: the index
+    names its order_by column."""
+    schema = 'p int, c bigint, title text, PRIMARY KEY (p, c)'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        index_name = unique_name()
+        cql.execute(f"CREATE CUSTOM INDEX {index_name} ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': 'c'}}")
+        with pytest.raises(InvalidRequest, match=f"Cannot rename column c because it has dependent secondary indexes \\({index_name}\\)"):
+            cql.execute(f"ALTER TABLE {table} RENAME c TO c2")
+        cql.execute(f"DROP INDEX {test_keyspace}.{index_name}")
+        cql.execute(f"ALTER TABLE {table} RENAME c TO c2")
+
+
 def test_verify_candidates_scylla_needs_a_case_sensitive_ordered_index(cql, test_keyspace):
     """ScyllaDB's LIKE is case-sensitive, and a page it leaves short resumes from a cursor only an
     ordered index reports, so asking ScyllaDB to check anything else is refused when the index is
