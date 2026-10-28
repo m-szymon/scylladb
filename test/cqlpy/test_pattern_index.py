@@ -470,7 +470,7 @@ def test_paging_filtered_like_then_create_pattern_index_prepared(cql, test_keysp
 
 ###############################################################################
 # The options of an ordered pattern index and of the index node's segments:
-# order_by, min_gram and max_gram, segment_rows, rewrite and verify_candidates.
+# order_by, min_gram and max_gram, segment_rows, rewrite, verify_candidates and rarest_grams.
 # Queries on an ordered index are covered by test_pattern_ordering_with_mock.py
 # and test_pattern_verification_with_mock.py.
 ###############################################################################
@@ -482,6 +482,7 @@ def test_create_pattern_index_with_all_options(cql, test_keyspace):
     options = {
         'case_sensitive': 'true', 'min_gram': '2', 'max_gram': '5', 'order_by': 'registered_at',
         'segment_rows': '1000', 'rewrite': 'false', 'verify_candidates': 'scylla',
+        'rarest_grams': '4',
     }
     with new_test_table(cql, test_keyspace, schema) as table:
         index_name = unique_name()
@@ -499,9 +500,10 @@ def test_create_pattern_index_with_all_options(cql, test_keyspace):
     ("segment_rows", "0"), ("segment_rows", "200000"),
     ("rewrite", "true"), ("rewrite", "FALSE"),
     ("verify_candidates", "index"),
+    ("rarest_grams", "0"), ("rarest_grams", "4"),
 ])
 def test_create_pattern_index_with_valid_option_value(cql, test_keyspace, option, value):
-    """segment_rows takes 0 for no cap; verify_candidates = 'index' needs nothing else."""
+    """segment_rows takes 0 for no cap, rarest_grams 0 for all grams; verify_candidates = 'index' needs nothing else."""
     schema = 'p int primary key, title text'
     with new_test_table(cql, test_keyspace, schema) as table:
         cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'{option}': '{value}'}}")
@@ -517,6 +519,10 @@ def test_create_pattern_index_with_valid_option_value(cql, test_keyspace, option
     ("segment_rows", "x", "must be a number of rows"),
     ("segment_rows", "", "must be a number of rows"),
     ("segment_rows", "10rows", "must be a number of rows"),
+    ("rarest_grams", "-1", "must be a number of grams"),
+    ("rarest_grams", "four", "must be a number of grams"),
+    ("rarest_grams", "", "must be a number of grams"),
+    ("rarest_grams", "1000", "must be a number of grams"),
     ("rewrite", "maybe", "Invalid value in option 'rewrite'"),
     ("verify_candidates", "both", "Invalid value in option 'verify_candidates'"),
     ("order_by", "", "must name a column"),

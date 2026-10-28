@@ -492,6 +492,10 @@ The following options are supported for pattern indexes:
 |                         | ScyllaDB against the rows it reads anyway (``scylla``). ``scylla`` needs a case- |            |
 |                         | sensitive index with ``order_by``.                                               |            |
 +-------------------------+----------------------------------------------------------------------------------+------------+
+| ``rarest_grams``        | How many substrings of a literal part longer than ``max_gram`` the index node    | ``0``      |
+|                         | intersects, those in the fewest rows first; the check drops what the others      |            |
+|                         | would have. ``0`` intersects all of them.                                        |            |
++-------------------------+----------------------------------------------------------------------------------+------------+
 
 .. _drop-index-statement:
 

@@ -29,6 +29,7 @@ const sstring order_by_option = "order_by";
 const sstring segment_rows_option = "segment_rows";
 const sstring rewrite_option = "rewrite";
 const sstring verify_candidates_option = "verify_candidates";
+const sstring rarest_grams_option = "rarest_grams";
 const std::vector<sstring> verify_candidates_values = {"index", "scylla"};
 
 /// Whether `value` equals `expected`, ignoring letter case: the enumerated options are validated
@@ -46,6 +47,16 @@ void validate_row_count_option(std::string_view index, const sstring& name, cons
     if (!digits || std::stoull(value) > std::numeric_limits<uint32_t>::max()) {
         throw exceptions::invalid_request_exception(
                 format("Index {}: option '{}' must be a number of rows, or 0 for no cap, but is '{}'", index, name, value));
+    }
+}
+
+void validate_gram_count_option(std::string_view index, const sstring& name, const sstring& value) {
+    const bool digits = !value.empty() && value.size() <= 3 && std::ranges::all_of(value, [](char c) {
+        return c >= '0' && c <= '9';
+    });
+    if (!digits) {
+        throw exceptions::invalid_request_exception(
+                format("Index {}: option '{}' must be a number of grams, or 0 for all of them, but is '{}'", index, name, value));
     }
 }
 
@@ -75,6 +86,10 @@ const std::unordered_map<sstring, std::function<void(std::string_view, const sst
         // node against its stored value ('index', the default), or ScyllaDB against the rows it reads
         // anyway ('scylla'). Read by ScyllaDB only.
         {verify_candidates_option, std::bind_front(util::validate_enumerated_option, verify_candidates_values)},
+        // How many of a long keyword's substrings the index node intersects, the rarest first; the
+        // verification drops what the others would have. 0 for all of them, the default. Read by the
+        // index node only.
+        {rarest_grams_option, validate_gram_count_option},
 };
 
 /// Reads an already validated positive integer option, or the default when absent.
