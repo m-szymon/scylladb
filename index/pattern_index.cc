@@ -87,8 +87,8 @@ const std::unordered_map<sstring, std::function<void(std::string_view, const sst
         // anyway ('scylla'). Read by ScyllaDB only.
         {verify_candidates_option, std::bind_front(util::validate_enumerated_option, verify_candidates_values)},
         // How many of a long keyword's substrings the index node intersects, the rarest first; the
-        // verification drops what the others would have. 0 for all of them, the default. Read by the
-        // index node only.
+        // verification drops what the others would have. 4 by default, 0 for all of them. Read by
+        // the index node only.
         {rarest_grams_option, validate_gram_count_option},
 };
 
