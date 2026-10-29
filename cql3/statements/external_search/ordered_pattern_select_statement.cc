@@ -330,7 +330,9 @@ future<::shared_ptr<cql_transport::messages::result_message>> ordered_pattern_se
     if (_verifies_candidates && value_index < 0) {
         on_internal_error(opslogger, "pattern search verifies candidates but did not fetch the value to verify them on");
     }
-    const auto matcher = like_matcher(bytes_view(reinterpret_cast<const int8_t*>(pattern.data()), pattern.size()));
+    // Compiled on the first page that needs checking here: with the index node verifying, none
+    // does, and compiling a pattern costs a cheap query a sizeable share of its CPU.
+    std::optional<like_matcher> matcher;
 
     // The rows are read a node page at a time into one result set. The index node returns the keys
     // in the order the ORDER BY asks for, and query_base_table preserves that order on both of its
@@ -382,7 +384,10 @@ future<::shared_ptr<cql_transport::messages::result_message>> ordered_pattern_se
             if (page->verified) {
                 query::result_view::consume(rows, slice, builder_t::visitor<builder_t::nop_filter>(builder, *_query_schema, *_selection, builder_t::nop_filter()));
             } else {
-                query::result_view::consume(rows, slice, builder_t::visitor<pattern_filter>(builder, *_query_schema, *_selection, pattern_filter(matcher, value_index)));
+                if (!matcher) {
+                    matcher.emplace(bytes_view(reinterpret_cast<const int8_t*>(pattern.data()), pattern.size()));
+                }
+                query::result_view::consume(rows, slice, builder_t::visitor<pattern_filter>(builder, *_query_schema, *_selection, pattern_filter(*matcher, value_index)));
             }
         });
         returned = builder.result_set_size();
