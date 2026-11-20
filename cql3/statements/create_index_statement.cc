@@ -830,10 +830,10 @@ create_index_statement::build_index_schema(data_dictionary::database db, locator
             warnings.emplace_back(format(
                 "Every LIKE on column {} will be served by a pattern index instead of by filtering, even with ALLOW FILTERING. "
                 "This one serves a LIKE ordered by {} (or the first of them), all as declared or all reversed; such a query may "
-                "restrict only the LIKE, and needs a LIMIT of at most {} unless it is paged, otherwise it fails. "
+                "restrict only the LIKE and a range on {}, and needs a LIMIT of at most {} unless it is paged, otherwise it fails. "
                 "A LIKE without ORDER BY returns rows in table order, which this index does not keep, so it fails unless another "
                 "pattern index on the column serves it. Results are eventually consistent. Dropping the index restores filtered LIKE.",
-                targets[0]->column_name(), columns, external_index_select_statement::max_query_limit));
+                targets[0]->column_name(), columns, order.columns.front().name, external_index_select_statement::max_query_limit));
         } else {
             warnings.emplace_back(format(
                 "Every LIKE on column {} will be served by this pattern index instead of by filtering, even with ALLOW FILTERING. "

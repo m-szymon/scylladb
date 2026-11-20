@@ -424,7 +424,7 @@ def test_create_ordered_pattern_index_warns_about_its_own_rules(cql, test_keyspa
         result = cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': 'created'}}")
         pattern_warnings = [w for w in result.response_future.warnings or [] if "pattern index" in w]
         assert len(pattern_warnings) == 1
-        assert "ordered by created ASC" in pattern_warnings[0]
+        assert "a range on created" in pattern_warnings[0]
         assert "unless it is paged" in pattern_warnings[0]
         assert "not paged" not in pattern_warnings[0]
 

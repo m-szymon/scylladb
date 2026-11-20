@@ -7,6 +7,7 @@
  */
 
 #include "cql3/statements/external_search/ordered_pattern_select_statement.hh"
+#include "cql3/statements/external_search/filter.hh"
 #include "cql3/statements/external_search/pattern_search.hh"
 #include "cql3/statements/index_latency.hh"
 #include "cql3/statements/raw/select_statement.hh"
@@ -34,15 +35,23 @@ namespace {
 
 logging::logger opslogger("ordered_pattern_search");
 
-/// The LIKE on the indexed column, which is all a pattern search may restrict.
-expr::binary_operator find_like(const restrictions::select_restrictions& select_restrictions, const secondary_index::index& index) {
+/// The LIKE on the indexed column, and any range bounds on the ordered column.
+struct ordered_pattern_restrictions {
+    expr::binary_operator like;
+    std::vector<expr::binary_operator> sort_bounds;
+};
+
+/// `order_by` is the column a range may restrict: the index's first ordering column, or none for
+/// an index in table order.
+ordered_pattern_restrictions find_restrictions(const restrictions::select_restrictions& select_restrictions, const secondary_index::index& index,
+        const std::optional<sstring>& order_by) {
     if (!select_restrictions.partition_key_restrictions_is_empty() || !restrictions::is_empty_restriction(select_restrictions.get_clustering_columns_restrictions())) {
         throw exceptions::invalid_request_exception("Pattern search queries do not support additional WHERE restrictions");
     }
     const auto& non_pk = select_restrictions.get_non_pk_restriction();
-    // The indexed column carries the LIKE. Nothing else may be restricted -- an unsupported
-    // predicate would be left to post-filtering, which these statements do not do, so it would be
-    // silently ignored rather than applied.
+    // The indexed column carries the LIKE; the sort column may carry a range alongside it. Nothing
+    // else may be restricted -- an unsupported predicate would be left to post-filtering, which these
+    // statements do not do, so it would be silently ignored rather than applied.
     auto like_entry = std::ranges::find_if(non_pk, [&](const auto& entry) {
         return entry.first->name_as_text() == index.target_column();
     });
@@ -58,14 +67,33 @@ expr::binary_operator find_like(const restrictions::select_restrictions& select_
         throw exceptions::invalid_request_exception(
                 seastar::format("Pattern search queries support only a single LIKE restriction on the indexed column {}", index.target_column()));
     }
+    std::vector<expr::binary_operator> sort_bounds;
     for (const auto& [other_column, other_restriction] : non_pk) {
-        if (other_column != column) {
+        if (other_column == column) {
+            continue;
+        }
+        if (!order_by) {
             throw exceptions::invalid_request_exception(seastar::format(
                     "Pattern search queries cannot restrict {}: only the indexed column {} may be restricted", other_column->name_as_text(),
                     index.target_column()));
         }
+        if (other_column->name_as_text() != *order_by) {
+            throw exceptions::invalid_request_exception(seastar::format(
+                    "Pattern search queries cannot restrict {}: only the indexed column {} and the first ordered column {} may be restricted",
+                    other_column->name_as_text(), index.target_column(), *order_by));
+        }
+        // Every factor on the sort column has to be a bound the index node can apply.
+        for (const auto& factor : expr::boolean_factors(other_restriction)) {
+            const auto* bound = expr::as_if<expr::binary_operator>(&factor);
+            if (!bound || !is_slice(bound->op)) {
+                throw exceptions::invalid_request_exception(seastar::format(
+                        "Pattern search queries support only range restrictions (<, <=, >, >=) on the ordered column {}",
+                        other_column->name_as_text()));
+            }
+            sort_bounds.push_back(*bound);
+        }
     }
-    return *binop;
+    return ordered_pattern_restrictions{*binop, std::move(sort_bounds)};
 }
 
 /// Checks an ORDER BY against the index's order (pattern_search::fit_ordering), and returns the
@@ -105,14 +133,17 @@ std::optional<ordered_pattern_select_statement::like_order> validate_ordering(
     }
     auto index_order = secondary_index::pattern_index::order_of(index.metadata());
     auto order = validate_ordering(*args.schema, *args.parameters, index_order);
-    auto like = find_like(*args.restrictions, index);
-    const auto* target_column = expr::as<expr::column_value>(like.lhs).col;
+    auto range_column = index_order.columns.empty() ? std::nullopt : std::optional<sstring>(index_order.columns.front().name);
+    auto found = find_restrictions(*args.restrictions, index, range_column);
+    const auto* target_column = expr::as<expr::column_value>(found.like.lhs).col;
 
-    return ::make_shared<ordered_pattern_select_statement>(std::move(index), target_column, std::move(like.rhs), order, std::move(args));
+    return ::make_shared<ordered_pattern_select_statement>(std::move(index), target_column, std::move(found.like.rhs),
+            std::move(found.sort_bounds), order, std::move(args));
 }
 
 ordered_pattern_select_statement::ordered_pattern_select_statement(secondary_index::index index, const column_definition* target_column,
-        expr::expression pattern, std::optional<like_order> order, external_statement_args args)
+        expr::expression pattern, std::vector<expr::binary_operator> sort_bounds, std::optional<like_order> order,
+        external_statement_args args)
     : external_index_select_statement(
               std::vector{search_source{
                       .family = functions::search_family::pattern,
@@ -123,6 +154,7 @@ ordered_pattern_select_statement::ordered_pattern_select_statement(secondary_ind
               external_search::prepared_filter{{}, args.parameters->allow_filtering()}, std::move(args))
     , _index(std::move(index))
     , _pattern(std::move(pattern))
+    , _sort_bounds(std::move(sort_bounds))
     , _order(order) {
 }
 
@@ -132,6 +164,50 @@ sstring ordered_pattern_select_statement::evaluate_pattern(const query_options& 
         throw exceptions::invalid_request_exception("The LIKE pattern of a pattern search query must not be null");
     }
     return pattern_search::query_pattern(pattern);
+}
+
+std::pair<std::optional<ordered_pattern_select_statement::sort_bound>, std::optional<ordered_pattern_select_statement::sort_bound>>
+ordered_pattern_select_statement::evaluate_sort_bounds(const query_options& options) const {
+    // A bound as evaluated, before it is encoded: the value's bytes, so that two bounds on the
+    // same side can be compared with the column's own comparator, and whether it includes them.
+    struct raw_bound {
+        cql3::raw_value value;
+        bool inclusive;
+    };
+    std::optional<raw_bound> min;
+    std::optional<raw_bound> max;
+    const column_definition* column = nullptr;
+    for (const auto& bound : _sort_bounds) {
+        auto value = expr::evaluate(bound.rhs, options);
+        if (value.is_null()) {
+            throw exceptions::invalid_request_exception("A range bound of a pattern search query must not be null");
+        }
+        column = expr::as<expr::column_value>(bound.lhs).col;
+        const bool inclusive = bound.op == expr::oper_t::GTE || bound.op == expr::oper_t::LTE;
+        const bool lower = bound.op == expr::oper_t::GT || bound.op == expr::oper_t::GTE;
+        if (!lower && bound.op != expr::oper_t::LT && bound.op != expr::oper_t::LTE) {
+            on_internal_error(opslogger, "a non-slice bound reached evaluate_sort_bounds");
+        }
+        // Of two bounds on one side the tighter wins: the larger lower bound, the smaller upper
+        // one, and at an equal value the exclusive one.
+        auto& side = lower ? min : max;
+        if (!side) {
+            side = raw_bound{std::move(value), inclusive};
+            continue;
+        }
+        auto order = column->type->compare(to_bytes(value.view()), to_bytes(side->value.view()));
+        const bool tighter = lower ? order > 0 : order < 0;
+        if (tighter || (order == 0 && !inclusive)) {
+            side = raw_bound{std::move(value), inclusive};
+        }
+    }
+    auto encode = [&](std::optional<raw_bound>& bound) -> std::optional<sort_bound> {
+        if (!bound) {
+            return std::nullopt;
+        }
+        return sort_bound{external_search::value_to_json(column->type, bound->value), bound->inclusive};
+    };
+    return {encode(min), encode(max)};
 }
 
 std::pair<std::optional<sstring>, uint64_t> ordered_pattern_select_statement::resume_point(const query_options& options, uint64_t limit) const {
@@ -204,6 +280,8 @@ future<::shared_ptr<cql_transport::messages::result_message>> ordered_pattern_se
     auto aoe = abort_on_expiry(timeout);
 
     const auto pattern = evaluate_pattern(options);
+    // Throws for a null bound. The values go to the index node as they are; it encodes them.
+    auto [min_sort_value, max_sort_value] = evaluate_sort_bounds(options);
 
     auto [cursor, remaining] = resume_point(options, limit);
     auto page_limit = page_size_for(options, remaining);
@@ -214,11 +292,18 @@ future<::shared_ptr<cql_transport::messages::result_message>> ordered_pattern_se
     // bounded number of times, and past that handed over short, which a paging client takes in
     // its stride.
     cql3::selection::result_set_builder builder(*_selection, _query_start_time_point, &options);
+    // The bounds are sent with every round, and a JSON value only moves.
+    auto copy_of = [](const std::optional<sort_bound>& bound) -> std::optional<sort_bound> {
+        if (!bound) {
+            return std::nullopt;
+        }
+        return sort_bound{rjson::copy(bound->value), bound->inclusive};
+    };
     uint64_t returned = 0;
     std::optional<sstring> next_cursor;
     for (unsigned round = 0;; ++round) {
         auto page = co_await qp.vector_store_client().like_page(_schema->ks_name(), _index.metadata().name(), _schema, pattern,
-                page_limit - returned, std::move(cursor), _order, aoe.abort_source());
+                page_limit - returned, std::move(cursor), _order, copy_of(min_sort_value), copy_of(max_sort_value), aoe.abort_source());
         if (!page.has_value()) {
             co_await coroutine::return_exception(
                     exceptions::invalid_request_exception(std::visit(vector_search::vector_store_client::like_error_visitor{}, page.error())));

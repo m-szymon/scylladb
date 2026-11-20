@@ -215,6 +215,14 @@ public:
         ascending,
         descending,
     };
+    /// One end of a range on an ordered index's sort column: the bounding value in the JSON
+    /// encoding of the column's type (the one the filtering API uses), and whether the bound
+    /// includes it. The index node turns it into its own sort key, so nothing here knows how the
+    /// node orders.
+    struct sort_bound {
+        rjson::value value;
+        bool inclusive;
+    };
     /// A page of an ordered pattern search: the keys, and where the next page resumes.
     /// `next_cursor` is empty when the page exhausted the matches.
     /// It is the index node's own position, passed back to it unchanged and never parsed here.
@@ -223,11 +231,11 @@ public:
         std::optional<sstring> next_cursor;
     };
     /// Like `like()`, for an index created with an `order_by` column: the keys come in `order`
-    /// (descending when none is given), and the
+    /// (descending when none is given), restricted to the sort values between the bounds, and the
     /// page reports where the next one resumes; `cursor` carries that back to read it.
     auto like_page(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit,
-            std::optional<sstring> cursor, std::optional<like_order> order, abort_source& as)
-            -> future<std::expected<like_page_result, like_error>>;
+            std::optional<sstring> cursor, std::optional<like_order> order, std::optional<sort_bound> min_sort_value,
+            std::optional<sort_bound> max_sort_value, abort_source& as) -> future<std::expected<like_page_result, like_error>>;
 
     /// Request a fragment of each of the given documents, with the terms of `fts_query` marked.
     ///

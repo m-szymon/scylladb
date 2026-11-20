@@ -355,9 +355,17 @@ auto read_like_json(rjson::value const& json, schema_ptr const& schema) -> std::
 }
 
 using like_order = vector_search::vector_store_client::like_order;
+using sort_bound = vector_search::vector_store_client::sort_bound;
 
-auto write_like_page_json(query_string pattern, limit limit, std::optional<sstring> const& cursor, std::optional<like_order> order)
-        -> json_content {
+auto sort_bound_json(sort_bound const& bound) -> rjson::value {
+    auto json = rjson::empty_object();
+    rjson::add(json, "value", rjson::copy(bound.value));
+    rjson::add(json, "inclusive", rjson::value(bound.inclusive));
+    return json;
+}
+
+auto write_like_page_json(query_string pattern, limit limit, std::optional<sstring> const& cursor, std::optional<like_order> order,
+        std::optional<sort_bound> const& min_sort_value, std::optional<sort_bound> const& max_sort_value) -> json_content {
     auto body = rjson::empty_object();
     rjson::add(body, "pattern", rjson::from_string(pattern));
     rjson::add(body, "limit", static_cast<uint64_t>(limit));
@@ -366,6 +374,12 @@ auto write_like_page_json(query_string pattern, limit limit, std::optional<sstri
     }
     if (order) {
         rjson::add(body, "order", rjson::from_string(*order == like_order::ascending ? "asc" : "desc"));
+    }
+    if (min_sort_value) {
+        rjson::add(body, "min_sort_value", sort_bound_json(*min_sort_value));
+    }
+    if (max_sort_value) {
+        rjson::add(body, "max_sort_value", sort_bound_json(*max_sort_value));
     }
     // Verification is the index node's default, so only declining it is spelled out.
     return rjson::print(body);
@@ -708,10 +722,10 @@ struct vector_store_client::impl {
     }
 
     auto like_page(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit,
-            std::optional<sstring> cursor, std::optional<like_order> order, abort_source& as)
-            -> future<std::expected<like_page_result, like_error>> {
+            std::optional<sstring> cursor, std::optional<like_order> order, std::optional<sort_bound> min_sort_value,
+            std::optional<sort_bound> max_sort_value, abort_source& as) -> future<std::expected<like_page_result, like_error>> {
         auto content = co_await post_to_index("like", format("/api/v1/indexes/{}/{}/like", keyspace, name),
-                write_like_page_json(std::move(pattern), limit, cursor, order), as);
+                write_like_page_json(std::move(pattern), limit, cursor, order, min_sort_value, max_sort_value), as);
         if (!content) {
             co_return std::unexpected{content.error()};
         }
@@ -890,9 +904,10 @@ auto vector_store_client::like(keyspace_name keyspace, index_name name, schema_p
 }
 
 auto vector_store_client::like_page(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit,
-        std::optional<sstring> cursor, std::optional<like_order> order, abort_source& as)
-        -> future<std::expected<like_page_result, like_error>> {
-    return _impl->like_page(std::move(keyspace), std::move(name), schema, std::move(pattern), limit, std::move(cursor), order, as);
+        std::optional<sstring> cursor, std::optional<like_order> order, std::optional<sort_bound> min_sort_value,
+        std::optional<sort_bound> max_sort_value, abort_source& as) -> future<std::expected<like_page_result, like_error>> {
+    return _impl->like_page(std::move(keyspace), std::move(name), schema, std::move(pattern), limit, std::move(cursor), order,
+            std::move(min_sort_value), std::move(max_sort_value), as);
 }
 
 auto vector_store_client::highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents documents, abort_source& as)
