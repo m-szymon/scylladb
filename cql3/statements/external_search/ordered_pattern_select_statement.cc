@@ -68,6 +68,27 @@ expr::binary_operator find_like(const restrictions::select_restrictions& select_
     return *binop;
 }
 
+/// Checks an ORDER BY against the index's order (pattern_search::fit_ordering), and returns the
+/// direction it asked for the first ordering column -- empty when the query has none, which an
+/// index in table order requires.
+///
+/// The coordinator's own ordering checks are skipped for an external search, so this is the only
+/// thing standing between a user and a query that claims an order the index cannot provide.
+std::optional<ordered_pattern_select_statement::like_order> validate_ordering(
+        const schema& schema, const raw::select_statement::parameters& parameters, const secondary_index::pattern_index::order& order) {
+    auto fit = pattern_search::fit_ordering(schema, parameters, order);
+    if (!fit.mismatch.empty()) {
+        throw exceptions::invalid_request_exception(fit.mismatch);
+    }
+    // The index node walks its order either way; the direction is passed to it and the rows come
+    // back in that order, so nothing here re-sorts them.
+    if (!fit.first_descending) {
+        return std::nullopt;
+    }
+    return *fit.first_descending ? ordered_pattern_select_statement::like_order::descending
+                                 : ordered_pattern_select_statement::like_order::ascending;
+}
+
 } // anonymous namespace
 
 ::shared_ptr<select_statement> ordered_pattern_select_statement::prepare(secondary_index::index index, external_statement_args args) {
@@ -82,20 +103,16 @@ expr::binary_operator find_like(const restrictions::select_restrictions& select_
     if (!args.restrictions->get_scoring_function_restrictions().empty()) {
         throw exceptions::invalid_request_exception("Pattern search queries cannot be combined with ANN or BM25");
     }
-    // The coordinator's own ordering checks are skipped for an external search, so this is the
-    // only thing standing between a user and a query that claims an order the index does not keep.
-    if (!args.parameters->orderings().empty()) {
-        throw exceptions::invalid_request_exception(
-                "Pattern search queries return rows in table order, as a filtered LIKE does, and cannot be ordered");
-    }
+    auto index_order = secondary_index::pattern_index::order_of(index.metadata());
+    auto order = validate_ordering(*args.schema, *args.parameters, index_order);
     auto like = find_like(*args.restrictions, index);
     const auto* target_column = expr::as<expr::column_value>(like.lhs).col;
 
-    return ::make_shared<ordered_pattern_select_statement>(std::move(index), target_column, std::move(like.rhs), std::move(args));
+    return ::make_shared<ordered_pattern_select_statement>(std::move(index), target_column, std::move(like.rhs), order, std::move(args));
 }
 
 ordered_pattern_select_statement::ordered_pattern_select_statement(secondary_index::index index, const column_definition* target_column,
-        expr::expression pattern, external_statement_args args)
+        expr::expression pattern, std::optional<like_order> order, external_statement_args args)
     : external_index_select_statement(
               std::vector{search_source{
                       .family = functions::search_family::pattern,
@@ -105,7 +122,8 @@ ordered_pattern_select_statement::ordered_pattern_select_statement(secondary_ind
               }},
               external_search::prepared_filter{{}, args.parameters->allow_filtering()}, std::move(args))
     , _index(std::move(index))
-    , _pattern(std::move(pattern)) {
+    , _pattern(std::move(pattern))
+    , _order(order) {
 }
 
 sstring ordered_pattern_select_statement::evaluate_pattern(const query_options& options) const {
@@ -190,7 +208,7 @@ future<::shared_ptr<cql_transport::messages::result_message>> ordered_pattern_se
     auto [cursor, remaining] = resume_point(options, limit);
     auto page_limit = page_size_for(options, remaining);
     // The rows are read a node page at a time into one result set. The index node returns the keys
-    // in table order, and query_base_table preserves that order on both of its
+    // in the order the ORDER BY asks for, and query_base_table preserves that order on both of its
     // paths, so no values provider and no re-sorting are needed. A page can come back short, when
     // the index names a row the table no longer has; it is topped up from the node's cursor a
     // bounded number of times, and past that handed over short, which a paging client takes in
@@ -200,7 +218,7 @@ future<::shared_ptr<cql_transport::messages::result_message>> ordered_pattern_se
     std::optional<sstring> next_cursor;
     for (unsigned round = 0;; ++round) {
         auto page = co_await qp.vector_store_client().like_page(_schema->ks_name(), _index.metadata().name(), _schema, pattern,
-                page_limit - returned, std::move(cursor), aoe.abort_source());
+                page_limit - returned, std::move(cursor), _order, aoe.abort_source());
         if (!page.has_value()) {
             co_await coroutine::return_exception(
                     exceptions::invalid_request_exception(std::visit(vector_search::vector_store_client::like_error_visitor{}, page.error())));

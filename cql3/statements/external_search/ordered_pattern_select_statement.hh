@@ -16,19 +16,28 @@
 
 namespace cql3::statements {
 
-/// A pattern search:
+/// A pattern search on an index created with an `order_by` column:
 ///
-///     SELECT ... WHERE name LIKE '%kw%' [LIMIT n]
+///     SELECT ... WHERE name LIKE '%kw%' [ORDER BY sort_column DESC|ASC] [LIMIT n]
 ///
-/// The index node walks its matches in table order, and
+/// The index node walks its matches in the order of the sort column, and
 /// reports where it stopped, so a page resumes there: the position travels in the driver's paging
 /// state, and a paged query needs no LIMIT. Rows are read from the base table in the node's order.
+///
+/// Every pattern index keeps an order -- its `order_by` columns, or table order without them --
+/// so this statement serves every pattern search.
 class ordered_pattern_select_statement : public external_index_select_statement {
+public:
+    using like_order = vector_search::vector_store_client::like_order;
+
 private:
     secondary_index::index _index;
     /// The LIKE pattern, unevaluated because it may be a bind marker. It goes to the index node as
     /// written, and the node decides whether it can serve it.
     expr::expression _pattern;
+    /// The direction the query's ORDER BY asked for, empty when it had none. It is sent to the
+    /// index node, which walks its sort column that way; without one the node picks its default.
+    std::optional<like_order> _order;
 
 public:
     /// The largest LIMIT of an unpaged query, and the largest page of a paged one.
@@ -37,7 +46,7 @@ public:
     static ::shared_ptr<select_statement> prepare(secondary_index::index index, external_statement_args args);
 
     ordered_pattern_select_statement(secondary_index::index index, const column_definition* target_column, expr::expression pattern,
-            external_statement_args args);
+            std::optional<like_order> order, external_statement_args args);
 
 private:
     future<::shared_ptr<cql_transport::messages::result_message>> do_execute(

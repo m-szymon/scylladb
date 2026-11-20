@@ -210,17 +210,24 @@ public:
     auto like(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit, abort_source& as)
             -> future<std::expected<primary_keys, like_error>>;
 
-    /// A page of a pattern search: the keys, in the index's order, and where the next page resumes.
+    /// The direction an ordered pattern search walks the index's `order_by` column in.
+    enum class like_order {
+        ascending,
+        descending,
+    };
+    /// A page of an ordered pattern search: the keys, and where the next page resumes.
     /// `next_cursor` is empty when the page exhausted the matches.
     /// It is the index node's own position, passed back to it unchanged and never parsed here.
     struct like_page_result {
         primary_keys keys;
         std::optional<sstring> next_cursor;
     };
-    /// Like `like()`, a page at a time: the page reports where the next one resumes, and `cursor`
-    /// carries that back to read it.
+    /// Like `like()`, for an index created with an `order_by` column: the keys come in `order`
+    /// (descending when none is given), and the
+    /// page reports where the next one resumes; `cursor` carries that back to read it.
     auto like_page(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit,
-            std::optional<sstring> cursor, abort_source& as) -> future<std::expected<like_page_result, like_error>>;
+            std::optional<sstring> cursor, std::optional<like_order> order, abort_source& as)
+            -> future<std::expected<like_page_result, like_error>>;
 
     /// Request a fragment of each of the given documents, with the terms of `fts_query` marked.
     ///

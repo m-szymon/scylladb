@@ -15,16 +15,34 @@
 #include "index/secondary_index_manager.hh"
 #include "dht/i_partitioner.hh"
 #include "types/tuple.hh"
+#include <boost/algorithm/string/case_conv.hpp>
 #include <seastar/core/sstring.hh>
 #include <algorithm>
+#include <cctype>
 
 namespace secondary_index {
 
 namespace {
 
+const sstring order_by_option = "order_by";
+
+/// Whether `value` equals `expected`, ignoring letter case: the enumerated options are validated
+/// that way, so they have to be read that way too.
+bool option_is(const sstring& value, std::string_view expected) {
+    return std::ranges::equal(value, expected, [](char a, char b) {
+        return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+    });
+}
+
 const std::unordered_map<sstring, std::function<void(std::string_view, const sstring&, const sstring&)>> pattern_index_options = {
         // 'case_sensitive' set to false lowercases both the indexed values and the patterns.
         {"case_sensitive", std::bind_front(util::validate_enumerated_option, util::boolean_values)},
+        // What the index answers in: the columns it orders by; absent, table order.
+        // Only the syntax is checked here; the columns are checked against the schema in
+        // check_order().
+        {order_by_option, [](std::string_view, const sstring&, const sstring& value) {
+             pattern_index::parse_order(value);
+         }},
 };
 
 } // anonymous namespace
@@ -119,8 +137,132 @@ bool is_table_order_key_type(const abstract_type& type) {
 
 } // anonymous namespace
 
-void pattern_index::check_table_order(const schema& schema) const {
-    // The index answers in table order, which the index node computes:
+pattern_index::order pattern_index::parse_order(std::string_view value) {
+    auto fail = [&](std::string_view why) {
+        return exceptions::invalid_request_exception(format("Pattern index option 'order_by' = '{}': {}", value, why));
+    };
+    struct item {
+        std::string name;
+        bool quoted;
+        std::optional<bool> descending;
+    };
+    std::vector<item> items;
+    size_t at = 0;
+    auto skip_spaces = [&] {
+        while (at < value.size() && std::isspace(static_cast<unsigned char>(value[at]))) {
+            ++at;
+        }
+    };
+    for (;;) {
+        skip_spaces();
+        item next{.quoted = false};
+        if (at < value.size() && value[at] == '"') {
+            next.quoted = true;
+            ++at;
+            for (;;) {
+                if (at == value.size()) {
+                    throw fail("an unterminated quoted name");
+                }
+                if (value[at] == '"') {
+                    if (at + 1 < value.size() && value[at + 1] == '"') {
+                        next.name += '"';
+                        at += 2;
+                        continue;
+                    }
+                    ++at;
+                    break;
+                }
+                next.name += value[at++];
+            }
+            if (next.name.empty()) {
+                throw fail("an empty column name");
+            }
+        } else {
+            // Unquoted: CQL's identifier characters, ASCII only; anything else has to be quoted.
+            while (at < value.size() && (std::isalnum(static_cast<unsigned char>(value[at])) || value[at] == '_')) {
+                next.name += value[at++];
+            }
+            if (next.name.empty()) {
+                throw fail("expected a column name");
+            }
+        }
+        skip_spaces();
+        std::string word;
+        while (at < value.size() && std::isalpha(static_cast<unsigned char>(value[at]))) {
+            word += value[at++];
+        }
+        if (option_is(sstring(word), "asc")) {
+            next.descending = false;
+        } else if (option_is(sstring(word), "desc")) {
+            next.descending = true;
+        } else if (!word.empty()) {
+            throw fail(format("expected ASC, DESC or a comma after {}, got {}", next.name, word));
+        }
+        items.push_back(std::move(next));
+        skip_spaces();
+        if (at == value.size()) {
+            break;
+        }
+        if (value[at] != ',') {
+            throw fail(format("unexpected '{}'", value[at]));
+        }
+        ++at;
+    }
+    if (items.size() > max_order_columns) {
+        throw fail(format("at most {} columns can be ordered by", max_order_columns));
+    }
+    order result{.what = order::kind::columns};
+    for (auto& item : items) {
+        auto name = sstring(item.quoted ? item.name : boost::to_lower_copy(item.name));
+        if (std::ranges::any_of(result.columns, [&](const order::column& column) {
+                return column.name == name;
+            })) {
+            throw fail(format("column {} is named twice", name));
+        }
+        result.columns.push_back(order::column{std::move(name), item.descending.value_or(false)});
+    }
+    return result;
+}
+
+pattern_index::order pattern_index::order_of(const index_metadata& im) {
+    auto it = im.options().find(order_by_option);
+    return it == im.options().end() ? order{} : parse_order(it->second);
+}
+
+void pattern_index::check_order(const schema& schema, const cql3::statements::index_specific_prop_defs& properties) const {
+    const auto& options = properties.get_raw_options();
+    auto it = options.find(order_by_option);
+    auto order = it == options.end() ? pattern_index::order{} : parse_order(it->second);
+    for (const auto& column : order.columns) {
+        const auto& name = column.name;
+        auto const* c_def = schema.get_column_definition(to_bytes(name));
+        if (c_def == nullptr) {
+            throw exceptions::invalid_request_exception(format("Pattern index orders by column {}, which is not in the table", name));
+        }
+        // The index node keeps an ordering value as a fixed-width integer, so only the types with
+        // an order-preserving image in one can be ordered by. This is the node's rule
+        // (`is_orderable` in its cql_types.rs) repeated so that a bad index is refused at CREATE
+        // rather than later; a disagreement refuses an index, it cannot misorder one.
+        switch (c_def->type->without_reversed().get_kind()) {
+        case abstract_type::kind::byte:
+        case abstract_type::kind::short_kind:
+        case abstract_type::kind::int32:
+        case abstract_type::kind::long_kind:
+        case abstract_type::kind::counter:
+        case abstract_type::kind::timestamp:
+        case abstract_type::kind::time:
+        case abstract_type::kind::date:
+        case abstract_type::kind::simple_date:
+            break;
+        default:
+            throw exceptions::invalid_request_exception(
+                    format("Pattern index cannot order by column {}: only integer and time columns can be ordered by", name));
+        }
+        if (!c_def->is_regular() && !c_def->is_primary_key()) {
+            throw exceptions::invalid_request_exception(format("Pattern index cannot order by column {}, which is a {} column", name, to_sstring(c_def->kind)));
+        }
+    }
+    // Ties, and an index without order_by, are in table order, which the index node computes:
     // the token with Murmur3, and the key's order with its own copy of each type's comparator.
     if (!schema.get_partitioner().name().ends_with("Murmur3Partitioner")) {
         throw exceptions::invalid_request_exception(
@@ -141,7 +283,7 @@ void pattern_index::validate(const schema& schema, const cql3::statements::index
     check_target(schema, targets);
     check_cdc_options(schema);
     check_index_options(properties);
-    check_table_order(schema);
+    check_order(schema, properties);
 }
 
 bool pattern_index::is_pattern_index_on_column(const index_metadata& im, const sstring& column) {

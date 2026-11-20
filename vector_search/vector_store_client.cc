@@ -354,12 +354,18 @@ auto read_like_json(rjson::value const& json, schema_ptr const& schema) -> std::
     return read_scored_primary_keys_json(json, schema, std::nullopt);
 }
 
-auto write_like_page_json(query_string pattern, limit limit, std::optional<sstring> const& cursor) -> json_content {
+using like_order = vector_search::vector_store_client::like_order;
+
+auto write_like_page_json(query_string pattern, limit limit, std::optional<sstring> const& cursor, std::optional<like_order> order)
+        -> json_content {
     auto body = rjson::empty_object();
     rjson::add(body, "pattern", rjson::from_string(pattern));
     rjson::add(body, "limit", static_cast<uint64_t>(limit));
     if (cursor) {
         rjson::add(body, "cursor", rjson::from_string(*cursor));
+    }
+    if (order) {
+        rjson::add(body, "order", rjson::from_string(*order == like_order::ascending ? "asc" : "desc"));
     }
     // Verification is the index node's default, so only declining it is spelled out.
     return rjson::print(body);
@@ -702,9 +708,10 @@ struct vector_store_client::impl {
     }
 
     auto like_page(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit,
-            std::optional<sstring> cursor, abort_source& as) -> future<std::expected<like_page_result, like_error>> {
+            std::optional<sstring> cursor, std::optional<like_order> order, abort_source& as)
+            -> future<std::expected<like_page_result, like_error>> {
         auto content = co_await post_to_index("like", format("/api/v1/indexes/{}/{}/like", keyspace, name),
-                write_like_page_json(std::move(pattern), limit, cursor), as);
+                write_like_page_json(std::move(pattern), limit, cursor, order), as);
         if (!content) {
             co_return std::unexpected{content.error()};
         }
@@ -883,8 +890,9 @@ auto vector_store_client::like(keyspace_name keyspace, index_name name, schema_p
 }
 
 auto vector_store_client::like_page(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit,
-        std::optional<sstring> cursor, abort_source& as) -> future<std::expected<like_page_result, like_error>> {
-    return _impl->like_page(std::move(keyspace), std::move(name), schema, std::move(pattern), limit, std::move(cursor), as);
+        std::optional<sstring> cursor, std::optional<like_order> order, abort_source& as)
+        -> future<std::expected<like_page_result, like_error>> {
+    return _impl->like_page(std::move(keyspace), std::move(name), schema, std::move(pattern), limit, std::move(cursor), order, as);
 }
 
 auto vector_store_client::highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents documents, abort_source& as)

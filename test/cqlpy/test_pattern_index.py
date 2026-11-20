@@ -416,6 +416,19 @@ def test_create_pattern_index_warns_about_like(cql, test_keyspace):
         assert "Every LIKE on column title will be served by this pattern index" in pattern_warnings[0]
 
 
+def test_create_ordered_pattern_index_warns_about_its_own_rules(cql, test_keyspace):
+    """An index with order_by orders and pages its LIKE queries, and its warning says so rather than
+    calling them unpaged and unordered."""
+    schema = 'p int primary key, title text, created bigint'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        result = cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': 'created'}}")
+        pattern_warnings = [w for w in result.response_future.warnings or [] if "pattern index" in w]
+        assert len(pattern_warnings) == 1
+        assert "ordered by created ASC" in pattern_warnings[0]
+        assert "unless it is paged" in pattern_warnings[0]
+        assert "not paged" not in pattern_warnings[0]
+
+
 def test_create_existing_pattern_index_if_not_exists_does_not_warn(cql, test_keyspace):
     """CREATE INDEX IF NOT EXISTS on an existing pattern index changes nothing, so it does not warn."""
     schema = 'p int primary key, title text'
@@ -464,16 +477,110 @@ def test_paging_filtered_like_then_create_pattern_index_prepared(cql, test_keysp
 
 
 ###############################################################################
-# Table order: what the index node needs of the table to keep it.
+# The options of an ordered pattern index: order_by.
+# Queries on an ordered index are covered by test_pattern_ordering_with_mock.py.
 ###############################################################################
+
+
+def test_create_pattern_index_with_all_options(cql, test_keyspace):
+    """Every option is accepted together and stored as given, for the index node to read."""
+    schema = 'p int primary key, title text, registered_at timestamp'
+    options = {
+        'case_sensitive': 'true', 'order_by': 'registered_at',
+    }
+    with new_test_table(cql, test_keyspace, schema) as table:
+        index_name = unique_name()
+        options_cql = ', '.join(f"'{k}': '{v}'" for k, v in options.items())
+        cql.execute(f"CREATE CUSTOM INDEX {index_name} ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{{options_cql}}}")
+        stored = cql.execute(
+            f"SELECT options FROM system_schema.indexes WHERE keyspace_name = '{test_keyspace}' "
+            f"AND table_name = '{table.split('.')[1]}' AND index_name = '{index_name}'").one().options
+        for k, v in options.items():
+            assert stored[k] == v
+
+
+@pytest.mark.parametrize("option, value, error", [
+    ("order_by", "", "expected a column name"),
+    ("order_by", "a b", "expected ASC, DESC or a comma"),
+    ("order_by", "a, a", "named twice"),
+    ("order_by", "a, b, c, d, e", "at most 4 columns"),
+    ("order_by", '"a', "unterminated quoted name"),
+])
+def test_create_pattern_index_with_bad_option_value_fails_for_new_options(cql, test_keyspace, option, value, error):
+    """Each option validates its value."""
+    schema = 'p int primary key, title text'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        with pytest.raises(InvalidRequest, match=error):
+            cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'{option}': '{value}'}}")
+
+
+def test_order_by_accepts_integer_and_time_columns(cql, test_keyspace):
+    """The index node keeps the sort value as a fixed-width integer, so these are the types it can order."""
+    column_types = ["tinyint", "smallint", "int", "bigint", "timestamp", "date", "time"]
+    schema = 'p int primary key, title text, ' + ', '.join(f'v_{t} {t}' for t in column_types)
+    with new_test_table(cql, test_keyspace, schema) as table:
+        for t in column_types:
+            index_name = unique_name()
+            cql.execute(f"CREATE CUSTOM INDEX {index_name} ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': 'v_{t}'}}")
+            cql.execute(f"DROP INDEX {test_keyspace}.{index_name}")
+
+
+def test_order_by_rejects_other_column_types(cql, test_keyspace):
+    """A column with no order-preserving fixed-width integer image is refused at creation; the index
+    node applies the same rule, and the two must agree."""
+    column_types = ["text", "boolean", "float", "double", "decimal", "varint", "uuid", "timeuuid", "blob"]
+    schema = 'p int primary key, title text, ' + ', '.join(f'v_{t} {t}' for t in column_types)
+    with new_test_table(cql, test_keyspace, schema) as table:
+        for t in column_types:
+            with pytest.raises(InvalidRequest, match="only integer and time columns can be ordered by"):
+                cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': 'v_{t}'}}")
+        # The indexed column itself is text, so it cannot be its own sort column either.
+        with pytest.raises(InvalidRequest, match="only integer and time columns can be ordered by"):
+            cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': 'title'}}")
+
+
+def test_order_by_must_name_a_column_of_the_table(cql, test_keyspace):
+    """A sort column that does not exist is refused at creation. Accepting it would leave the
+    index answering in its own order while the query claims another."""
+    schema = 'p int primary key, title text'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        with pytest.raises(InvalidRequest, match="no_such_column, which is not in the table"):
+            cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': 'no_such_column'}}")
+
+
+def test_order_by_accepts_key_columns_and_rejects_a_static_column(cql, test_keyspace):
+    """The sort value may come from the primary key or a regular column, but not from a static one."""
+    schema = 'p int, c bigint, s int static, title text, PRIMARY KEY (p, c)'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        for column in ['p', 'c']:
+            index_name = unique_name()
+            cql.execute(f"CREATE CUSTOM INDEX {index_name} ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': '{column}'}}")
+            cql.execute(f"DROP INDEX {test_keyspace}.{index_name}")
+        with pytest.raises(InvalidRequest, match="(?i)cannot order by column s, which is a static column"):
+            cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': 's'}}")
+
+
+def test_order_by_takes_several_columns_with_directions(cql, test_keyspace):
+    """Columns as in CQL: unquoted names are case-insensitive, quoted ones kept; each column may say
+    ASC or DESC; the value is stored as given, for the index node to read with the same rules."""
+    schema = 'p int primary key, title text, a int, "Mixed" bigint'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        for order_by in ['A DESC, "Mixed"', 'a asc', '"Mixed" DESC, a ASC']:
+            index_name = unique_name()
+            cql.execute(f"CREATE CUSTOM INDEX {index_name} ON {table}(title) USING 'pattern_index' "
+                        f"WITH OPTIONS = {{'order_by': '{order_by}'}}")
+            cql.execute(f"DROP INDEX {test_keyspace}.{index_name}")
+        with pytest.raises(InvalidRequest, match="mixed, which is not in the table"):
+            cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'order_by': 'Mixed'}}")
 
 
 def test_table_order_needs_key_types_the_index_node_can_order(cql, test_keyspace):
     """Every index keeps table order and compares primary keys on the index node, which supports
     a set of key types; a key of any other type refuses the index."""
     with new_test_table(cql, test_keyspace, 'p decimal primary key, title text, n int') as table:
-        with pytest.raises(InvalidRequest, match="primary key column p of type decimal"):
-            cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index'")
+        for options in ["", " WITH OPTIONS = {'order_by': 'n'}"]:
+            with pytest.raises(InvalidRequest, match="primary key column p of type decimal"):
+                cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index'{options}")
     schema = 'p frozen<tuple<int, text>>, c timeuuid, d inet, title text, PRIMARY KEY (p, c, d)'
     with new_test_table(cql, test_keyspace, schema, "WITH CLUSTERING ORDER BY (c DESC, d ASC)") as table:
         cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index'")

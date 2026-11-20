@@ -820,12 +820,28 @@ create_index_statement::build_index_schema(data_dictionary::database db, locator
 
     // A new pattern index changes the results of existing `LIKE` queries on its column.
     if (secondary_index::secondary_index_manager::is_custom_index<secondary_index::pattern_index>(index)) {
-        warnings.emplace_back(format(
-            "Every LIKE on column {} will be served by this pattern index instead of by filtering, even with ALLOW FILTERING. "
-            "Such a query must have the LIKE as its only restriction, cannot be ordered, and needs a LIMIT of at most {} unless "
-            "it is paged, otherwise it fails. It returns its rows in table order, as a filtered LIKE does, and is eventually "
-            "consistent. Dropping the index restores filtered LIKE.",
-            targets[0]->column_name(), external_index_select_statement::max_query_limit));
+        using kind = secondary_index::pattern_index::order::kind;
+        auto order = secondary_index::pattern_index::order_of(index);
+        if (order.what == kind::columns) {
+            sstring columns;
+            for (const auto& column : order.columns) {
+                columns += seastar::format("{}{} {}", columns.empty() ? "" : ", ", column.name, column.descending ? "DESC" : "ASC");
+            }
+            warnings.emplace_back(format(
+                "Every LIKE on column {} will be served by a pattern index instead of by filtering, even with ALLOW FILTERING. "
+                "This one serves a LIKE ordered by {} (or the first of them), all as declared or all reversed; such a query may "
+                "restrict only the LIKE, and needs a LIMIT of at most {} unless it is paged, otherwise it fails. "
+                "A LIKE without ORDER BY returns rows in table order, which this index does not keep, so it fails unless another "
+                "pattern index on the column serves it. Results are eventually consistent. Dropping the index restores filtered LIKE.",
+                targets[0]->column_name(), columns, external_index_select_statement::max_query_limit));
+        } else {
+            warnings.emplace_back(format(
+                "Every LIKE on column {} will be served by this pattern index instead of by filtering, even with ALLOW FILTERING. "
+                "Such a query must have the LIKE as its only restriction, cannot be ordered, and needs a LIMIT of at most {} unless "
+                "it is paged, otherwise it fails. It returns its rows in table order, as a filtered LIKE does, and is eventually "
+                "consistent. Dropping the index restores filtered LIKE.",
+                targets[0]->column_name(), external_index_select_statement::max_query_limit));
+        }
     }
 
     ++_cql_stats->secondary_index_creates;
