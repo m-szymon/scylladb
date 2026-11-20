@@ -210,6 +210,18 @@ public:
     auto like(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit, abort_source& as)
             -> future<std::expected<primary_keys, like_error>>;
 
+    /// A page of a pattern search: the keys, in the index's order, and where the next page resumes.
+    /// `next_cursor` is empty when the page exhausted the matches.
+    /// It is the index node's own position, passed back to it unchanged and never parsed here.
+    struct like_page_result {
+        primary_keys keys;
+        std::optional<sstring> next_cursor;
+    };
+    /// Like `like()`, a page at a time: the page reports where the next one resumes, and `cursor`
+    /// carries that back to read it.
+    auto like_page(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit,
+            std::optional<sstring> cursor, abort_source& as) -> future<std::expected<like_page_result, like_error>>;
+
     /// Request a fragment of each of the given documents, with the terms of `fts_query` marked.
     ///
     /// The index is asked because choosing which of a document's terms matter needs the corpus

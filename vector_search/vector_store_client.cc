@@ -354,6 +354,32 @@ auto read_like_json(rjson::value const& json, schema_ptr const& schema) -> std::
     return read_scored_primary_keys_json(json, schema, std::nullopt);
 }
 
+auto write_like_page_json(query_string pattern, limit limit, std::optional<sstring> const& cursor) -> json_content {
+    auto body = rjson::empty_object();
+    rjson::add(body, "pattern", rjson::from_string(pattern));
+    rjson::add(body, "limit", static_cast<uint64_t>(limit));
+    if (cursor) {
+        rjson::add(body, "cursor", rjson::from_string(*cursor));
+    }
+    // Verification is the index node's default, so only declining it is spelled out.
+    return rjson::print(body);
+}
+
+/// The cursor a page reports, if any. Absent is normal -- the last page reports none --
+/// so only a present-but-wrong value is an error. The string is kept as it came: it is the index
+/// node's to interpret.
+auto read_next_cursor_json(rjson::value const& json) -> std::expected<std::optional<sstring>, like_error> {
+    auto const* cursor_json = rjson::find(json, "next_cursor");
+    if (cursor_json == nullptr || cursor_json->IsNull()) {
+        return std::optional<sstring>{};
+    }
+    if (!cursor_json->IsString()) {
+        vslogger.error("Vector Store returned invalid JSON: 'next_cursor' is not a string");
+        return std::unexpected{service_reply_format_error{}};
+    }
+    return std::optional<sstring>{sstring(cursor_json->GetString(), cursor_json->GetStringLength())};
+}
+
 auto write_highlight_json(query_string query, documents docs) -> json_content {
     auto quoted_docs = docs | std::views::transform([](auto const& doc) {
         return rjson::quote_json_string(doc);
@@ -675,6 +701,31 @@ struct vector_store_client::impl {
         }
     }
 
+    auto like_page(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit,
+            std::optional<sstring> cursor, abort_source& as) -> future<std::expected<like_page_result, like_error>> {
+        auto content = co_await post_to_index("like", format("/api/v1/indexes/{}/{}/like", keyspace, name),
+                write_like_page_json(std::move(pattern), limit, cursor), as);
+        if (!content) {
+            co_return std::unexpected{content.error()};
+        }
+
+        try {
+            auto json = rjson::parse(std::move(*content));
+            auto keys = read_like_json(json, schema);
+            if (!keys) {
+                co_return std::unexpected{keys.error()};
+            }
+            auto next_cursor = read_next_cursor_json(json);
+            if (!next_cursor) {
+                co_return std::unexpected{next_cursor.error()};
+            }
+            co_return like_page_result{std::move(*keys), std::move(*next_cursor)};
+        } catch (const rjson::error& e) {
+            vslogger.error("Vector Store returned invalid JSON: {}", e.what());
+            co_return std::unexpected{service_reply_format_error{}};
+        }
+    }
+
     auto highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents docs, abort_source& as)
             -> future<std::expected<highlights, fts_error>> {
         auto documents_sent = docs.size();
@@ -829,6 +880,11 @@ auto vector_store_client::bm25(keyspace_name keyspace, index_name name, schema_p
 auto vector_store_client::like(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit, abort_source& as)
         -> future<std::expected<primary_keys, like_error>> {
     return _impl->like(std::move(keyspace), std::move(name), schema, std::move(pattern), limit, as);
+}
+
+auto vector_store_client::like_page(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit,
+        std::optional<sstring> cursor, abort_source& as) -> future<std::expected<like_page_result, like_error>> {
+    return _impl->like_page(std::move(keyspace), std::move(name), schema, std::move(pattern), limit, std::move(cursor), as);
 }
 
 auto vector_store_client::highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents documents, abort_source& as)
