@@ -477,7 +477,8 @@ def test_paging_filtered_like_then_create_pattern_index_prepared(cql, test_keysp
 
 
 ###############################################################################
-# The options of an ordered pattern index: order_by.
+# The options of an ordered pattern index and of the index node's segments:
+# order_by, min_gram and max_gram.
 # Queries on an ordered index are covered by test_pattern_ordering_with_mock.py.
 ###############################################################################
 
@@ -486,7 +487,7 @@ def test_create_pattern_index_with_all_options(cql, test_keyspace):
     """Every option is accepted together and stored as given, for the index node to read."""
     schema = 'p int primary key, title text, registered_at timestamp'
     options = {
-        'case_sensitive': 'true', 'order_by': 'registered_at',
+        'case_sensitive': 'true', 'min_gram': '2', 'max_gram': '5', 'order_by': 'registered_at',
     }
     with new_test_table(cql, test_keyspace, schema) as table:
         index_name = unique_name()
@@ -499,7 +500,22 @@ def test_create_pattern_index_with_all_options(cql, test_keyspace):
             assert stored[k] == v
 
 
+@pytest.mark.parametrize("option, value", [
+    ("min_gram", "1"), ("min_gram", "3"), ("max_gram", "8"),
+])
+def test_create_pattern_index_with_valid_option_value(cql, test_keyspace, option, value):
+    """A valid value of an option is accepted."""
+    schema = 'p int primary key, title text'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'{option}': '{value}'}}")
+
+
 @pytest.mark.parametrize("option, value, error", [
+    ("min_gram", "0", "out of valid range"),
+    ("min_gram", "9", "out of valid range"),
+    ("max_gram", "-1", "out of valid range"),
+    ("max_gram", "three", "is not an integer"),
+    ("max_gram", "3.5", "is not an integer"),
     ("order_by", "", "expected a column name"),
     ("order_by", "a b", "expected ASC, DESC or a comma"),
     ("order_by", "a, a", "named twice"),
@@ -512,6 +528,25 @@ def test_create_pattern_index_with_bad_option_value_fails_for_new_options(cql, t
     with new_test_table(cql, test_keyspace, schema) as table:
         with pytest.raises(InvalidRequest, match=error):
             cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'{option}': '{value}'}}")
+
+
+def test_create_pattern_index_min_gram_above_max_gram_fails(cql, test_keyspace):
+    """The two gram lengths must be consistent, whether both or only one is given."""
+    schema = 'p int primary key, title text'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        with pytest.raises(InvalidRequest, match=r"min_gram \(4\) must not be greater than max_gram \(3\)"):
+            cql.execute(
+                f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' "
+                f"WITH OPTIONS = {{'min_gram': '4', 'max_gram': '3'}}"
+            )
+        # Only min_gram given: compared against the default max_gram of 3.
+        with pytest.raises(InvalidRequest, match=r"min_gram \(4\) must not be greater than max_gram \(3\)"):
+            cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'min_gram': '4'}}")
+        # Equal is fine.
+        cql.execute(
+            f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' "
+            f"WITH OPTIONS = {{'min_gram': '3', 'max_gram': '3'}}"
+        )
 
 
 def test_order_by_accepts_integer_and_time_columns(cql, test_keyspace):

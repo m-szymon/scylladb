@@ -24,6 +24,8 @@ namespace secondary_index {
 
 namespace {
 
+const sstring min_gram_option = "min_gram";
+const sstring max_gram_option = "max_gram";
 const sstring order_by_option = "order_by";
 
 /// Whether `value` equals `expected`, ignoring letter case: the enumerated options are validated
@@ -37,6 +39,11 @@ bool option_is(const sstring& value, std::string_view expected) {
 const std::unordered_map<sstring, std::function<void(std::string_view, const sstring&, const sstring&)>> pattern_index_options = {
         // 'case_sensitive' set to false lowercases both the indexed values and the patterns.
         {"case_sensitive", std::bind_front(util::validate_enumerated_option, util::boolean_values)},
+        // The length in characters of the shortest indexed substring. A shorter keyword cannot be answered.
+        {min_gram_option, std::bind_front(util::validate_positive_option, pattern_index::max_gram_limit)},
+        // The length in characters of the longest indexed substring. A keyword up to this length is a
+        // single exact lookup; a longer one is answered from its substrings and verified.
+        {max_gram_option, std::bind_front(util::validate_positive_option, pattern_index::max_gram_limit)},
         // What the index answers in: the columns it orders by; absent, table order.
         // Only the syntax is checked here; the columns are checked against the schema in
         // check_order().
@@ -44,6 +51,12 @@ const std::unordered_map<sstring, std::function<void(std::string_view, const sst
              pattern_index::parse_order(value);
          }},
 };
+
+/// Reads an already validated positive integer option, or the default when absent.
+unsigned gram_option(const index_options_map& options, const sstring& name, unsigned default_value) {
+    auto it = options.find(name);
+    return it == options.end() ? default_value : static_cast<unsigned>(std::stoul(it->second));
+}
 
 } // anonymous namespace
 
@@ -91,12 +104,21 @@ void pattern_index::check_target(const schema& schema, const std::vector<::share
 }
 
 void pattern_index::check_index_options(const cql3::statements::index_specific_prop_defs& properties) const {
-    for (const auto& option : properties.get_raw_options()) {
+    const auto& options = properties.get_raw_options();
+    for (const auto& option : options) {
         auto it = pattern_index_options.find(option.first);
         if (it == pattern_index_options.end()) {
             throw exceptions::invalid_request_exception(format("Unsupported option {} for pattern index", option.first));
         }
         it->second(index_type_name(), option.first, option.second);
+    }
+
+    // Each option is valid on its own; the pair must also make sense together.
+    auto min_gram = gram_option(options, min_gram_option, default_min_gram);
+    auto max_gram = gram_option(options, max_gram_option, default_max_gram);
+    if (min_gram > max_gram) {
+        throw exceptions::invalid_request_exception(
+                format("Invalid options for pattern index: min_gram ({}) must not be greater than max_gram ({})", min_gram, max_gram));
     }
 }
 

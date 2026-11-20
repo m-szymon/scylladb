@@ -24,6 +24,12 @@ public:
     static constexpr std::string_view INDEX_TYPE_NAME = "pattern";
     static constexpr std::string_view SEARCH_TYPE_NAME = "Pattern Search";
 
+    // These defaults are the Vector Store's; the two must agree because the node applies them to
+    // an index created without the option.
+    static constexpr unsigned default_min_gram = 1;
+    static constexpr unsigned default_max_gram = 3;
+    static constexpr unsigned max_gram_limit = 8;
+
     std::string_view index_type_name() const override {
         return INDEX_TYPE_NAME;
     }
