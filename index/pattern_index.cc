@@ -17,6 +17,7 @@
 #include "types/tuple.hh"
 #include <boost/algorithm/string/case_conv.hpp>
 #include <seastar/core/sstring.hh>
+#include <limits>
 #include <algorithm>
 #include <cctype>
 
@@ -27,6 +28,8 @@ namespace {
 const sstring min_gram_option = "min_gram";
 const sstring max_gram_option = "max_gram";
 const sstring order_by_option = "order_by";
+const sstring segment_rows_option = "segment_rows";
+const sstring rewrite_option = "rewrite";
 
 /// Whether `value` equals `expected`, ignoring letter case: the enumerated options are validated
 /// that way, so they have to be read that way too.
@@ -34,6 +37,16 @@ bool option_is(const sstring& value, std::string_view expected) {
     return std::ranges::equal(value, expected, [](char a, char b) {
         return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
     });
+}
+
+void validate_row_count_option(std::string_view index, const sstring& name, const sstring& value) {
+    const bool digits = !value.empty() && value.size() <= 10 && std::ranges::all_of(value, [](char c) {
+        return c >= '0' && c <= '9';
+    });
+    if (!digits || std::stoull(value) > std::numeric_limits<uint32_t>::max()) {
+        throw exceptions::invalid_request_exception(
+                format("Index {}: option '{}' must be a number of rows, or 0 for no cap, but is '{}'", index, name, value));
+    }
 }
 
 const std::unordered_map<sstring, std::function<void(std::string_view, const sstring&, const sstring&)>> pattern_index_options = {
@@ -50,6 +63,12 @@ const std::unordered_map<sstring, std::function<void(std::string_view, const sst
         {order_by_option, [](std::string_view, const sstring&, const sstring& value) {
              pattern_index::parse_order(value);
          }},
+        // The most rows the index node puts in one segment of an ordered index, which keeps segments
+        // narrow in the sort column; 0 for no cap. Absent, the node picks it for an ordered index.
+        {segment_rows_option, validate_row_count_option},
+        // Whether the index node rewrites segments that span far more of the sort column than their
+        // share of the rows. Absent, on wherever there is a cap.
+        {rewrite_option, std::bind_front(util::validate_enumerated_option, util::boolean_values)},
 };
 
 /// Reads an already validated positive integer option, or the default when absent.

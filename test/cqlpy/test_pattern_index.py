@@ -478,7 +478,7 @@ def test_paging_filtered_like_then_create_pattern_index_prepared(cql, test_keysp
 
 ###############################################################################
 # The options of an ordered pattern index and of the index node's segments:
-# order_by, min_gram and max_gram.
+# order_by, min_gram and max_gram, segment_rows and rewrite.
 # Queries on an ordered index are covered by test_pattern_ordering_with_mock.py.
 ###############################################################################
 
@@ -488,6 +488,7 @@ def test_create_pattern_index_with_all_options(cql, test_keyspace):
     schema = 'p int primary key, title text, registered_at timestamp'
     options = {
         'case_sensitive': 'true', 'min_gram': '2', 'max_gram': '5', 'order_by': 'registered_at',
+        'segment_rows': '1000', 'rewrite': 'false',
     }
     with new_test_table(cql, test_keyspace, schema) as table:
         index_name = unique_name()
@@ -502,9 +503,11 @@ def test_create_pattern_index_with_all_options(cql, test_keyspace):
 
 @pytest.mark.parametrize("option, value", [
     ("min_gram", "1"), ("min_gram", "3"), ("max_gram", "8"),
+    ("segment_rows", "0"), ("segment_rows", "200000"),
+    ("rewrite", "true"), ("rewrite", "FALSE"),
 ])
 def test_create_pattern_index_with_valid_option_value(cql, test_keyspace, option, value):
-    """A valid value of an option is accepted."""
+    """segment_rows takes 0 for no cap."""
     schema = 'p int primary key, title text'
     with new_test_table(cql, test_keyspace, schema) as table:
         cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index' WITH OPTIONS = {{'{option}': '{value}'}}")
@@ -516,6 +519,11 @@ def test_create_pattern_index_with_valid_option_value(cql, test_keyspace, option
     ("max_gram", "-1", "out of valid range"),
     ("max_gram", "three", "is not an integer"),
     ("max_gram", "3.5", "is not an integer"),
+    ("segment_rows", "-1", "must be a number of rows"),
+    ("segment_rows", "x", "must be a number of rows"),
+    ("segment_rows", "", "must be a number of rows"),
+    ("segment_rows", "10rows", "must be a number of rows"),
+    ("rewrite", "maybe", "Invalid value in option 'rewrite'"),
     ("order_by", "", "expected a column name"),
     ("order_by", "a b", "expected ASC, DESC or a comma"),
     ("order_by", "a, a", "named twice"),
