@@ -73,14 +73,14 @@ For the option and its default, see
    ``ALLOW FILTERING``:
 
    * Queries that worked by filtering start failing. The ``LIKE`` must be the
-     only restriction in the ``WHERE`` clause, and the query needs a ``LIMIT``
-     of at most 1000, so for example a ``LIKE`` together with a restriction on
-     the partition key, or a ``LIKE`` without a ``LIMIT``, is rejected.
+     only restriction in the ``WHERE`` clause, and an unpaged query needs a
+     ``LIMIT`` of at most 1000, so for example a ``LIKE`` together with a
+     restriction on the partition key is rejected. An index with ``order_by``
+     columns serves only queries ordered by them; see `Ordering and Paging`_.
    * Queries that still succeed can return different rows, without any error.
-     The index is eventually consistent, so a recent write may be missed, and
-     the rows are neither paged nor ordered. With
-     ``'case_sensitive': 'false'``, matching ignores letter case, so a ``LIKE``
-     returns rows that a filtered ``LIKE`` does not.
+     The index is eventually consistent, so a recent write may be missed.
+     With ``'case_sensitive': 'false'``, matching ignores letter case, so a
+     ``LIKE`` returns rows that a filtered ``LIKE`` does not.
    * When the index node is unavailable, every ``LIKE`` on the column fails.
 
    ``CREATE INDEX`` returns a warning that summarizes these changes. Dropping the
@@ -132,6 +132,10 @@ column from the index, even with ``ALLOW FILTERING``. The full rules are in
 Indexed vs. Filtered LIKE
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
+The indexed column of the table below describes an index without ``order_by``,
+which keeps table order. One with ``order_by`` columns is ordered by them; see
+`Ordering and Paging`_.
+
 Without a pattern index, ``LIKE`` is a filter: ScyllaDB reads the rows and
 checks each value against the pattern, as described in
 :ref:`LIKE Operator <like-operator>`. On a column with a pattern index, the
@@ -155,20 +159,17 @@ filtered one as follows:
 | ``ALLOW FILTERING``  | Required.                                | Not needed. If given, it is ignored and the index is |
 |                      |                                          | still used.                                          |
 +----------------------+------------------------------------------+------------------------------------------------------+
-| ``LIMIT``            | Optional, any value.                     | Required, at most 1000.                              |
+| ``LIMIT``            | Optional, any value.                     | Optional when paged; at most 1000 when not.          |
 +----------------------+------------------------------------------+------------------------------------------------------+
 | Other restrictions   | Allowed, as in any query with            | None: the ``LIKE`` must be the only ``WHERE``        |
 | and clauses          | ``ALLOW FILTERING``.                     | restriction, and ``ORDER BY``, ``GROUP BY``,         |
 |                      |                                          | ``PER PARTITION LIMIT`` and aggregation are          |
 |                      |                                          | rejected.                                            |
 +----------------------+------------------------------------------+------------------------------------------------------+
-| Paging               | Paged like any other query.              | Not paged: the whole result is returned in one page, |
-|                      |                                          | with a warning when the page size is smaller than    |
-|                      |                                          | ``LIMIT``.                                           |
+| Paging               | Paged like any other query.              | Paged like any other query.                          |
 +----------------------+------------------------------------------+------------------------------------------------------+
-| Order                | The order of a scan: by token, then by   | Not specified. When more rows match than the         |
-|                      | clustering key.                          | ``LIMIT``, which of them are returned is not         |
-|                      |                                          | specified either.                                    |
+| Order                | The order of a scan: by token, then by   | The same, and ``LIMIT n`` returns the first ``n``    |
+|                      | clustering key.                          | rows of it.                                          |
 +----------------------+------------------------------------------+------------------------------------------------------+
 | Consistency          | The rows are read, and matched, at the   | Eventually consistent, and the rows are not checked  |
 |                      | query's consistency level.               | against the pattern again: shortly after a write, a  |
@@ -178,6 +179,55 @@ filtered one as follows:
 | Failure              | Fails as any read does.                  | Also fails when the index node is unavailable or     |
 |                      |                                          | does not support the pattern.                        |
 +----------------------+------------------------------------------+------------------------------------------------------+
+
+Ordering and Paging
+-------------------
+
+A ``LIKE`` without ``ORDER BY`` returns its rows in table order, as a filtered
+``LIKE`` does, and that is the order an index without ``order_by`` keeps. A
+search box that shows the newest matches first, a page at a time, needs an
+index ordered by another column. The ``order_by`` option declares up to four
+columns, each optionally ``ASC`` (the default) or ``DESC``; each must be an
+integer, ``date``, ``time`` or ``timestamp`` column::
+
+    CREATE CUSTOM INDEX ON ks.users (nickname) USING 'pattern_index'
+        WITH OPTIONS = {'order_by': 'registered_at DESC'};
+
+    SELECT user_id, nickname FROM ks.users
+        WHERE nickname LIKE '%将军%'
+        ORDER BY registered_at DESC;
+
+    SELECT user_id, nickname FROM ks.users
+        WHERE nickname LIKE '%将军%' AND registered_at < '2026-01-01'
+        ORDER BY registered_at DESC;
+
+* The index keeps its rows by the declared columns, then in table order. It
+  serves a query that orders by a prefix of those columns, all in their
+  declared directions or all reversed, as a table serves ordering by its
+  clustering columns. With ``'order_by': 'a DESC, b'``, ``ORDER BY a DESC``,
+  ``ORDER BY a DESC, b ASC`` and ``ORDER BY a ASC, b DESC`` are served, and
+  ``ORDER BY a DESC, b DESC`` is rejected.
+* A ``LIKE`` without ``ORDER BY`` is not served by such an index, since it does
+  not keep table order; it is rejected, unless another pattern index on the
+  column serves it. Several pattern indexes on one column are allowed, and each
+  query uses the one whose order fits it.
+* A range on the first ordering column (``<``, ``<=``, ``>``, ``>=``) narrows
+  the search.
+* A row whose ordering column is null is not in the index, as a materialized
+  view leaves out a row whose key column is null.
+* The query is paged by the index, the way the drivers page every query: a
+  later page resumes where the previous one ended and costs about what the first
+  one did, and rows sharing ordering values are neither skipped nor repeated. A
+  paged query needs no ``LIMIT``; a query that is not paged needs one of at most
+  1000.
+* A page may hold fewer rows than the page size, or none, while more follow.
+  Read until the driver reports no more pages.
+
+To keep a later page as cheap as the first, the index node keeps its internal
+segments narrow along its order (``segment_rows``) and rewrites the wide ones
+an index created on an already loaded table, or one taking writes out of its
+order, starts with (``rewrite``). Both are on by default. The
+options are described in :ref:`Pattern Index <create-pattern-index-statement>`.
 
 Dropping a Pattern Index
 ------------------------

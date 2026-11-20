@@ -11,8 +11,8 @@ This document covers the implementation and the decisions behind it.
 `pattern_index` is the third external (Vector Store backed) index kind, next to `vector_index`
 and `fulltext_index`. The index node answers `POST /api/v1/indexes/{ks}/{index}/like` with the
 primary keys of the rows whose value matches a `LIKE` pattern, and ScyllaDB reads those rows from
-the base table. Nothing is scored, so the reply carries primary keys only and the rows come back
-in no particular order.
+the base table. Nothing is scored, so the reply carries primary keys only, in no particular order;
+ScyllaDB returns the rows in table order.
 
 ## Why a separate index kind
 
@@ -56,10 +56,42 @@ column and stating these rules.
 
 ## Execution
 
-The pattern is evaluated, a null one rejected, and posted with the `LIMIT` to `/like`. At most
-`LIMIT` of the returned keys are kept and read from the base table. Nothing is scored, so on a table
-with clustering keys the rows come back in the order the base-table reads deliver them, not in the
-index's order.
+A pattern index is in one of two orders, read from its `order_by` option by
+`pattern_index::order_of` (the option's syntax is `parse_order`, which the index node repeats):
+table order (no option), or the declared columns then table order.
+`pattern_search::index_for` picks, among the pattern indexes on the `LIKE`'s column, one whose
+order fits the query (`fit_ordering`): a query without `ORDER BY` wants table order; one with
+`ORDER BY` wants an index ordered by those columns, a prefix of them, all as declared or all
+reversed. With none that fits, the first is taken and its statement says why the query does not
+fit.
+
+## Ordered search
+
+Every pattern index is served by `ordered_pattern_select_statement`, chosen in
+`select_statement::prepare`. It derives from `external_index_select_statement` for the base-table
+read only and replaces `do_execute`:
+
+- `ORDER BY` must fit the index's order (`fit_ordering`, above); an index in table order takes none.
+  The `WHERE` clause may add a range on the first ordering column. The coordinator's own ordering
+  checks are skipped for an external search, so the statement validates both itself. The range goes
+  to the index node as typed values (`min_sort_value`, `max_sort_value`), which the node encodes;
+  ScyllaDB never sees the node's sort keys. The direction asked for the first column goes as
+  `order`; the node walks its order or the exact reverse.
+- The node walks its matches in that order and reports `next_cursor`, an opaque string that names
+  the last row's place in the order and its primary key. It travels in the driver's paging state
+  (`paging_state::get_index_cursor()`, an optional field of the IDL), so a page resumes there and
+  rows tied on the ordering values are neither skipped nor repeated. A paging state without a cursor
+  was made by another statement (a filtered `LIKE` paged before the index existed) and is refused.
+- A paged query needs no LIMIT and asks for at most 1000 keys a page; an unpaged one needs a LIMIT of
+  at most 1000. The check is made at execution, because only then is it known whether the query is
+  paged.
+- A page left short, by keys the table no longer has, is topped up from the cursor up to three
+  times when paged, until full when not.
+
+At `CREATE INDEX` (`pattern_index::check_order`), an index that keeps an order is refused on a table
+whose partitioner is not Murmur3 or whose primary key has a column of a type the index node cannot
+order (`is_table_order_key_type`, the node's `is_key_type_supported`): the node computes table
+order itself, from the token and the key's values.
 
 ## Options
 
