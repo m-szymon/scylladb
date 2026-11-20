@@ -29,12 +29,6 @@ namespace cql3::statements::pattern_search {
 std::optional<secondary_index::index> index_for(data_dictionary::database db, const schema_ptr& schema,
         const expr::expression& where_clause);
 
-/// The search to run on the index. Rejects a query that:
-/// - restricts anything but a single LIKE, or
-/// - has ORDER BY, since the rows come back unordered.
-search_source source_for(secondary_index::index index, const schema& schema, const restrictions::select_restrictions& restrictions,
-        bool has_ordering);
-
 /// The pattern an evaluated query value holds.
 sstring query_pattern(const cql3::raw_value& value);
 

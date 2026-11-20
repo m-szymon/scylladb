@@ -65,9 +65,13 @@ void metadata::maybe_set_paging_state(lw_shared_ptr<const service::pager::paging
     if (paging_state->get_remaining() > 0) {
         set_paging_state(std::move(paging_state));
     } else {
-        _flags.remove<flag::HAS_MORE_PAGES>();
-        _paging_state = nullptr;
+        clear_paging_state();
     }
+}
+
+void metadata::clear_paging_state() {
+    _flags.remove<flag::HAS_MORE_PAGES>();
+    _paging_state = nullptr;
 }
 
 void metadata::set_skip_metadata() {

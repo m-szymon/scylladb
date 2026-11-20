@@ -76,7 +76,7 @@ def test_create_pattern_index_on_key_or_static_column_fails(cql, test_keyspace):
 
 
 def test_create_pattern_index_with_valid_options(cql, test_keyspace):
-    """case_sensitive, the only option, takes a boolean in any letter case."""
+    """case_sensitive takes a boolean in any letter case."""
     schema = 'p int primary key, title text'
     with new_test_table(cql, test_keyspace, schema) as table:
         for value in ['true', 'false', 'TRUE', 'False']:
@@ -252,10 +252,10 @@ def test_like_bind_marker_prepares_without_allow_filtering(cql, pattern_table):
 
 def test_like_requires_limit(cql, pattern_table):
     """A LIKE on the indexed column is served by the index even with ALLOW FILTERING,
-    so it needs a LIMIT."""
+    so it needs a LIMIT unless it is paged."""
     for allow_filtering in ["", "ALLOW FILTERING"]:
-        with pytest.raises(InvalidRequest, match="must have a limit specified"):
-            cql.execute(f"SELECT * FROM {pattern_table} WHERE title LIKE 'ell%' {allow_filtering}")
+        with pytest.raises(InvalidRequest, match="require a LIMIT unless they are paged"):
+            cql.execute(SimpleStatement(f"SELECT * FROM {pattern_table} WHERE title LIKE 'ell%' {allow_filtering}", fetch_size=None))
 
 
 def test_like_on_column_without_pattern_index_uses_filtering(cql, pattern_table):
@@ -287,8 +287,8 @@ def test_like_on_fulltext_indexed_column_uses_filtering(cql, test_keyspace):
 @pytest.mark.parametrize("where, message", [
     ("p = 1 AND title LIKE '%ell%'", "do not support additional WHERE restrictions"),
     ("token(p) > 0 AND title LIKE '%ell%'", "do not support additional WHERE restrictions"),
-    ("title LIKE '%ell%' AND other = 'x'", "support exactly one LIKE restriction"),
-    ("title LIKE 'h%' AND title LIKE '%d'", "support exactly one LIKE restriction"),
+    ("title LIKE '%ell%' AND other = 'x'", "cannot restrict other"),
+    ("title LIKE 'h%' AND title LIKE '%d'", "support only a single LIKE restriction"),
 ], ids=["partition_key", "token", "other_column", "two_likes"])
 def test_like_rejects_additional_restrictions(cql, pattern_table, where, message):
     """The index answers exactly one LIKE; anything else in WHERE is rejected, not filtered."""
@@ -301,7 +301,7 @@ def test_like_rejects_additional_restrictions(cql, pattern_table, where, message
 def test_like_with_another_restriction_on_its_column_is_not_filtered(cql, pattern_table, allow_filtering):
     """Index selection passes over the pattern index here, but the LIKE is not left to filtering,
     and the query is rejected as a pattern search rather than asked for ALLOW FILTERING."""
-    with pytest.raises(InvalidRequest, match="support exactly one LIKE restriction"):
+    with pytest.raises(InvalidRequest, match="support only a single LIKE restriction"):
         cql.execute(f"SELECT * FROM {pattern_table} WHERE title LIKE 'h%' AND title > 'a' LIMIT 10 {allow_filtering}")
 
 
@@ -351,12 +351,12 @@ def test_like_rejects_scoring_function(cql, test_keyspace):
 
 
 @pytest.mark.parametrize("clause, message", [
-    ("ORDER BY p", "do not support ORDER BY"),
+    ("ORDER BY p", "return rows in table order"),
     ("PER PARTITION LIMIT 1", "do not support per-partition limits"),
     ("GROUP BY p", "cannot be run with aggregation"),
 ], ids=["order_by", "per_partition_limit", "group_by"])
 def test_like_rejects_ordering_grouping_and_per_partition_limit(cql, pattern_table, clause, message):
-    """The rows come back in no particular order and cannot be grouped."""
+    """The rows come back in table order and cannot be ordered otherwise, or grouped."""
     with pytest.raises(InvalidRequest, match=message):
         cql.execute(f"SELECT * FROM {pattern_table} WHERE title LIKE '%ell%' {clause} LIMIT 10")
 
@@ -381,8 +381,8 @@ def test_creating_pattern_index_breaks_filtered_like(cql, test_keyspace):
         assert [r.p for r in cql.execute(with_key)] == [1]
 
         cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index'")
-        with pytest.raises(InvalidRequest, match="Pattern search queries must have a limit specified"):
-            cql.execute(without_limit)
+        with pytest.raises(InvalidRequest, match="Pattern search queries require a LIMIT unless they are paged"):
+            cql.execute(SimpleStatement(without_limit, fetch_size=None))
         with pytest.raises(InvalidRequest, match="Pattern search queries do not support additional WHERE restrictions"):
             cql.execute(with_key)
 
@@ -396,8 +396,8 @@ def test_dropping_pattern_index_restores_filtered_like(cql, test_keyspace):
         without_limit = f"SELECT p FROM {table} WHERE title LIKE 'h%' ALLOW FILTERING"
         index_name = unique_name()
         cql.execute(f"CREATE CUSTOM INDEX {index_name} ON {table}(title) USING 'pattern_index'")
-        with pytest.raises(InvalidRequest, match="Pattern search queries must have a limit specified"):
-            cql.execute(without_limit)
+        with pytest.raises(InvalidRequest, match="Pattern search queries require a LIMIT unless they are paged"):
+            cql.execute(SimpleStatement(without_limit, fetch_size=None))
 
         cql.execute(f"DROP INDEX {test_keyspace}.{index_name}")
         assert sorted(r.p for r in cql.execute(without_limit)) == [1, 2]
@@ -461,3 +461,19 @@ def test_paging_filtered_like_then_create_pattern_index_prepared(cql, test_keysp
         cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index'")
         with pytest.raises(InvalidRequest, match="Cannot continue paged query: this query is served by a pattern index"):
             cql.execute(stmt, paging_state=r.paging_state)
+
+
+###############################################################################
+# Table order: what the index node needs of the table to keep it.
+###############################################################################
+
+
+def test_table_order_needs_key_types_the_index_node_can_order(cql, test_keyspace):
+    """Every index keeps table order and compares primary keys on the index node, which supports
+    a set of key types; a key of any other type refuses the index."""
+    with new_test_table(cql, test_keyspace, 'p decimal primary key, title text, n int') as table:
+        with pytest.raises(InvalidRequest, match="primary key column p of type decimal"):
+            cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index'")
+    schema = 'p frozen<tuple<int, text>>, c timeuuid, d inet, title text, PRIMARY KEY (p, c, d)'
+    with new_test_table(cql, test_keyspace, schema, "WITH CLUSTERING ORDER BY (c DESC, d ASC)") as table:
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index'")

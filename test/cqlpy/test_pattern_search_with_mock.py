@@ -9,6 +9,10 @@
 # verify that Scylla translates a `LIKE` on a pattern-indexed column into
 # an HTTP POST to the `/like` endpoint of the Vector Store service, and reads
 # the returned rows from the base table.
+#
+# They run on an index without 'order_by', which keeps table order and pages,
+# through the same statement as an index with 'order_by' columns
+# (test_pattern_ordering_with_mock.py).
 ###############################################################################
 
 import json
@@ -102,17 +106,18 @@ def test_like_bind_marker_null_fails(cql, pattern_setup_with_mock):
     table, _ = pattern_setup_with_mock
 
     stmt = cql.prepare(f"SELECT id FROM {table} WHERE title LIKE ? LIMIT {NUM_ROWS}")
-    with pytest.raises(InvalidRequest, match="Unsupported null value for column title"):
+    with pytest.raises(InvalidRequest, match="The LIKE pattern of a pattern search query must not be null"):
         cql.execute(stmt, [None])
 
 
 def test_like_limit_exceeds_max_raises_error(cql, pattern_setup_with_mock):
-    """A LIMIT exceeding the external search maximum (1000) must be rejected; 1000 is accepted."""
+    """An unpaged query's LIMIT exceeding the external search maximum (1000) must be rejected;
+    1000 is accepted."""
     table, _ = pattern_setup_with_mock
 
     with pytest.raises(InvalidRequest, match="1000"):
-        cql.execute(f"SELECT id FROM {table} WHERE title LIKE '%ell%' LIMIT 1001")
-    cql.execute(f"SELECT id FROM {table} WHERE title LIKE '%ell%' LIMIT 1000")
+        cql.execute(SimpleStatement(f"SELECT id FROM {table} WHERE title LIKE '%ell%' LIMIT 1001", fetch_size=None))
+    cql.execute(SimpleStatement(f"SELECT id FROM {table} WHERE title LIKE '%ell%' LIMIT 1000", fetch_size=None))
 
 
 def test_like_http_error_propagated_as_invalid_request(cql, vector_store_mock, pattern_setup_with_mock):
@@ -131,33 +136,6 @@ def test_like_malformed_reply_is_an_error(cql, vector_store_mock, pattern_setup_
 
     with pytest.raises(InvalidRequest):
         cql.execute(f"SELECT id FROM {table} WHERE title LIKE '%ell%' LIMIT {NUM_ROWS}")
-
-
-def test_like_paging_warning_emitted(cql, pattern_setup_with_mock):
-    """A paging warning should be emitted when page_size < LIMIT."""
-    table, _ = pattern_setup_with_mock
-
-    result = cql.execute(SimpleStatement(f"SELECT id FROM {table} WHERE title LIKE '%ell%' LIMIT 100", fetch_size=1))
-
-    warnings = result.response_future.warnings
-    assert warnings
-    assert any("Paging is not supported for Pattern search queries" in w for w in warnings)
-
-
-def test_like_on_table_with_clustering_key_returns_the_named_rows(cql, test_keyspace, vector_store_mock):
-    """On a table with clustering keys every named row is read back; the order is not specified."""
-    schema = "p int, c int, title text, PRIMARY KEY (p, c)"
-    with new_test_table(cql, test_keyspace, schema) as table:
-        cql.execute(f"CREATE CUSTOM INDEX ON {table}(title) USING 'pattern_index'")
-        for p, c in [(1, 10), (1, 20), (2, 30)]:
-            cql.execute(f"INSERT INTO {table} (p, c, title) VALUES ({p}, {c}, 'hello')")
-
-        vector_store_mock.set_next_like_response(200, json.dumps({
-            "primary_keys": {"p": [2, 1], "c": [30, 10]},
-        }))
-
-        rows = list(cql.execute(f"SELECT p, c FROM {table} WHERE title LIKE '%ell%' LIMIT 2"))
-        assert sorted((r.p, r.c) for r in rows) == [(1, 10), (2, 30)]
 
 
 def test_like_stale_key_is_skipped(cql, vector_store_mock, pattern_setup_with_mock):
@@ -209,3 +187,41 @@ def test_like_multibyte_patterns(cql, test_keyspace, vector_store_mock):
             rows = list(cql.execute(f"SELECT id, title FROM {table} WHERE title LIKE '{pattern}' LIMIT 10"))
             assert [(r.id, r.title) for r in rows] == [(1, 'café')]
             assert json.loads(vector_store_mock.like_requests[-1].body)["pattern"] == pattern
+
+
+# --- an index without order_by: table order, paged --------------------------------
+
+
+@pytest.fixture(scope="module")
+def table_order_table(cql, test_keyspace):
+    table = test_keyspace + "." + unique_name()
+    idx = unique_name()
+    cql.execute(f"CREATE TABLE {table} (id int primary key, title text)")
+    cql.execute(f"CREATE CUSTOM INDEX {idx} ON {table}(title) USING 'pattern_index'")
+    for i in range(NUM_ROWS):
+        cql.execute(f"INSERT INTO {table} (id, title) VALUES ({i}, 'hello')")
+    yield table, idx
+    cql.execute(f"DROP TABLE {table}")
+
+
+def test_an_index_without_order_by_pages_in_the_order_the_node_keeps(cql, table_order_table, vector_store_mock):
+    """The index node keeps table order and pages it with a cursor; the request names no direction,
+    and the rows come back in the order the node named them, page after page."""
+    table, _ = table_order_table
+    vector_store_mock.set_like_responses([
+        (200, json.dumps({"primary_keys": {"id": [1, 0]}, "next_cursor": "after-0"})),
+        (200, json.dumps({"primary_keys": {"id": [2, 4]}, "next_cursor": "after-4"})),
+        (200, like_response([3])),
+    ])
+
+    statement = SimpleStatement(f"SELECT id FROM {table} WHERE title LIKE '%ell%'", fetch_size=2)
+    assert [row.id for row in cql.execute(statement)] == [1, 0, 2, 4, 3]
+    requests = vector_store_mock.like_requests
+    assert [request.cursor for request in requests] == [None, "after-0", "after-4"]
+    assert all(request.order is None for request in requests)
+
+
+def test_an_index_without_order_by_cannot_be_ordered(cql, table_order_table):
+    table, _ = table_order_table
+    with pytest.raises(InvalidRequest, match="return rows in table order"):
+        cql.execute(f"SELECT id FROM {table} WHERE title LIKE '%ell%' ORDER BY id DESC LIMIT {NUM_ROWS}")

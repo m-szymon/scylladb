@@ -46,7 +46,6 @@ class external_index_select_statement : public select_statement {
     std::vector<search_source> _sources;
     /// The restrictions a vector search prefilters by. Empty for any other query.
     external_search::prepared_filter _prepared_filter;
-    mutable gc_clock::time_point _query_start_time_point;
 
 public:
     /// The largest LIMIT an external-search query may ask for.
@@ -57,7 +56,11 @@ public:
     external_index_select_statement(std::vector<search_source> sources, external_search::prepared_filter prepared_filter,
             external_statement_args args);
 
-private:
+protected:
+    // The ordered pattern search (ordered_pattern_select_statement) pages through an index of its own
+    // and reuses the reading of the rows below.
+    mutable gc_clock::time_point _query_start_time_point;
+
     /// Base-table rows read for the keys the searches returned, together with the command they were
     /// read with. The command's slice is needed to walk the rows.
     struct base_table_read {

@@ -13,7 +13,10 @@
 #include "index/pattern_index.hh"
 #include "index/index_option_utils.hh"
 #include "index/secondary_index_manager.hh"
+#include "dht/i_partitioner.hh"
+#include "types/tuple.hh"
 #include <seastar/core/sstring.hh>
+#include <algorithm>
 
 namespace secondary_index {
 
@@ -79,12 +82,66 @@ void pattern_index::check_index_options(const cql3::statements::index_specific_p
     }
 }
 
+namespace {
+
+/// Whether a primary-key column of this type can take part in table order on the index node: the
+/// types whose order the node reproduces (`is_key_type_supported` in its pattern_index/order.rs).
+bool is_table_order_key_type(const abstract_type& type) {
+    switch (type.without_reversed().get_kind()) {
+    case abstract_type::kind::byte:
+    case abstract_type::kind::short_kind:
+    case abstract_type::kind::int32:
+    case abstract_type::kind::long_kind:
+    case abstract_type::kind::varint:
+    case abstract_type::kind::utf8:
+    case abstract_type::kind::ascii:
+    case abstract_type::kind::bytes:
+    case abstract_type::kind::boolean:
+    case abstract_type::kind::timestamp:
+    case abstract_type::kind::simple_date:
+    case abstract_type::kind::time:
+    case abstract_type::kind::uuid:
+    case abstract_type::kind::timeuuid:
+    case abstract_type::kind::inet:
+    case abstract_type::kind::float_kind:
+    case abstract_type::kind::double_kind:
+        return true;
+    case abstract_type::kind::tuple: {
+        const auto& tuple = static_cast<const tuple_type_impl&>(type.without_reversed());
+        return std::ranges::all_of(tuple.all_types(), [](const data_type& element) {
+            return is_table_order_key_type(*element);
+        });
+    }
+    default:
+        return false;
+    }
+}
+
+} // anonymous namespace
+
+void pattern_index::check_table_order(const schema& schema) const {
+    // The index answers in table order, which the index node computes:
+    // the token with Murmur3, and the key's order with its own copy of each type's comparator.
+    if (!schema.get_partitioner().name().ends_with("Murmur3Partitioner")) {
+        throw exceptions::invalid_request_exception(
+                "Pattern index keeps table order, which needs the Murmur3 partitioner");
+    }
+    for (const auto& c_def : schema.primary_key_columns()) {
+        if (!is_table_order_key_type(*c_def.type)) {
+            throw exceptions::invalid_request_exception(format(
+                    "Pattern index keeps table order, which it cannot for primary key column {} of type {}",
+                    c_def.name_as_text(), c_def.type->without_reversed().as_cql3_type().to_string()));
+        }
+    }
+}
+
 void pattern_index::validate(const schema& schema, const cql3::statements::index_specific_prop_defs& properties,
         const std::vector<::shared_ptr<cql3::statements::index_target>>& targets, const gms::feature_service&, const data_dictionary::database& db) const {
     check_uses_tablets(schema, db);
     check_target(schema, targets);
     check_cdc_options(schema);
     check_index_options(properties);
+    check_table_order(schema);
 }
 
 bool pattern_index::is_pattern_index_on_column(const index_metadata& im, const sstring& column) {

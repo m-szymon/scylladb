@@ -822,9 +822,9 @@ create_index_statement::build_index_schema(data_dictionary::database db, locator
     if (secondary_index::secondary_index_manager::is_custom_index<secondary_index::pattern_index>(index)) {
         warnings.emplace_back(format(
             "Every LIKE on column {} will be served by this pattern index instead of by filtering, even with ALLOW FILTERING. "
-            "Such a query must have the LIKE as its only restriction and a LIMIT of at most {}, otherwise it fails. "
-            "It is not paged, returns its rows in an unspecified order, and is eventually consistent. "
-            "Dropping the index restores filtered LIKE.",
+            "Such a query must have the LIKE as its only restriction, cannot be ordered, and needs a LIMIT of at most {} unless "
+            "it is paged, otherwise it fails. It returns its rows in table order, as a filtered LIKE does, and is eventually "
+            "consistent. Dropping the index restores filtered LIKE.",
             targets[0]->column_name(), external_index_select_statement::max_query_limit));
     }
 

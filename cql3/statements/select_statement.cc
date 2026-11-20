@@ -13,6 +13,7 @@
 #include "cql3/statements/select_statement.hh"
 #include "cql3/statements/external_search/external_index_select_statement.hh"
 #include "cql3/statements/external_search/pattern_search.hh"
+#include "cql3/statements/external_search/ordered_pattern_select_statement.hh"
 #include "cql3/statements/index_latency.hh"
 #include "cql3/expr/expression.hh"
 #include "cql3/expr/evaluate.hh"
@@ -2318,12 +2319,14 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
     auto restrictions = prepare_restrictions(db, schema, ctx, selection, _parameters->allow_filtering() || is_external_search,
             restrictions::check_indexes(!_parameters->is_mutation_fragments()), _pinned_plan);
 
-    std::optional<search_source> pattern_source;
+    // A pattern index keeps an order -- its order_by columns, or table order -- and ranges and
+    // pages its matches, which needs a statement of its own.
+    std::optional<secondary_index::index> ordered_pattern_index;
     if (pattern_index) {
         if (!restrictions->get_scoring_function_restrictions().empty()) {
             throw combined_search();
         }
-        pattern_source = pattern_search::source_for(std::move(*pattern_index), *schema, *restrictions, !_parameters->orderings().empty());
+        ordered_pattern_index = std::move(pattern_index);
     }
 
     plan.check_restrictions(*restrictions);
@@ -2454,9 +2457,23 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
                 prepare_limit(db, ctx, _per_partition_limit),
                 stats,
                 std::move(prepared_attrs));
+    } else if (ordered_pattern_index) {
+        stmt = ordered_pattern_select_statement::prepare(std::move(*ordered_pattern_index), external_statement_args{
+                .schema = schema,
+                .bound_terms = ctx.bound_variables_size(),
+                .parameters = _parameters,
+                .selection = std::move(selection),
+                .restrictions = std::move(restrictions),
+                .group_by_cell_indices = std::move(group_by_cell_indices),
+                .is_reversed = is_reversed_,
+                .ordering_comparator = std::move(ordering_comparator),
+                .limit = prepare_limit(db, ctx, _limit),
+                .per_partition_limit = prepare_limit(db, ctx, _per_partition_limit),
+                .stats = stats,
+                .attrs = std::move(prepared_attrs),
+        });
     } else if (is_external_search) {
-        auto sources = pattern_source ? std::vector{std::move(*pattern_source)} : plan.sources();
-        stmt = external_index_select_statement::prepare(std::move(sources), external_statement_args{
+        stmt = external_index_select_statement::prepare(plan.sources(), external_statement_args{
                 .schema = schema,
                 .bound_terms = ctx.bound_variables_size(),
                 .parameters = _parameters,
