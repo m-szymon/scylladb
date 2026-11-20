@@ -36,7 +36,7 @@ sstring declared_order(const secondary_index::pattern_index::order& order) {
 } // anonymous namespace
 
 std::optional<secondary_index::index> index_for(data_dictionary::database db, const schema_ptr& schema,
-        const expr::expression& where_clause) {
+        const expr::expression& where_clause, const raw::select_statement::parameters& parameters) {
     auto indexes = db.find_column_family(schema).get_index_manager().list_indexes();
     for (const auto& factor : expr::boolean_factors(where_clause)) {
         const auto* binop = expr::as_if<expr::binary_operator>(&factor);
@@ -45,12 +45,21 @@ std::optional<secondary_index::index> index_for(data_dictionary::database db, co
             continue;
         }
         auto column = lhs->ident->prepare_column_identifier(*schema)->text();
-        auto on_column = [&] (const secondary_index::index& index) {
-            return secondary_index::pattern_index::is_pattern_index_on_column(index.metadata(), column);
-        };
-        if (auto it = std::ranges::find_if(indexes, on_column); it != indexes.end()) {
-            return std::move(*it);
+        std::vector<secondary_index::index> on_column;
+        for (auto& index : indexes) {
+            if (secondary_index::pattern_index::is_pattern_index_on_column(index.metadata(), column)) {
+                on_column.push_back(index);
+            }
         }
+        if (on_column.empty()) {
+            continue;
+        }
+        // Fitting indexes first.
+        auto rank = [&](const secondary_index::index& index) {
+            auto order = secondary_index::pattern_index::order_of(index.metadata());
+            return fit_ordering(*schema, parameters, order).mismatch.empty() ? 0 : 1;
+        };
+        return std::move(*std::ranges::min_element(on_column, {}, rank));
     }
     return std::nullopt;
 }

@@ -27,9 +27,11 @@ class select_restrictions;
 /// - is never combined with another search.
 namespace cql3::statements::pattern_search {
 
-/// The pattern index on a column restricted by LIKE in the unprepared WHERE clause, if any.
+/// The pattern index on a column restricted by LIKE in the unprepared WHERE clause, if any. Of
+/// several on the column, the one whose order fits the query's ORDER BY (see fit_ordering). With
+/// none that fits, the first, whose statement then says why the query does not fit it.
 std::optional<secondary_index::index> index_for(data_dictionary::database db, const schema_ptr& schema,
-        const expr::expression& where_clause);
+        const expr::expression& where_clause, const raw::select_statement::parameters& parameters);
 
 /// How a query's ORDER BY fits an index's order.
 struct ordering_fit {

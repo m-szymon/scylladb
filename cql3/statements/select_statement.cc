@@ -2305,7 +2305,7 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
     // are prepared.
     // As for ANN and BM25, the restrictions are then prepared with filtering allowed, so a LIKE
     // the index cannot serve is rejected as a pattern search, not asked for ALLOW FILTERING.
-    auto pattern_index = _parameters->is_mutation_fragments() ? std::nullopt : pattern_search::index_for(db, schema, _where_clause);
+    auto pattern_index = _parameters->is_mutation_fragments() ? std::nullopt : pattern_search::index_for(db, schema, _where_clause, *_parameters);
     auto combined_search = [] {
         return exceptions::invalid_request_exception("Pattern search queries cannot be combined with ANN or BM25");
     };
