@@ -26,6 +26,7 @@
 ###############################################################################
 
 import json
+import time
 
 import pytest
 from cassandra.protocol import InvalidRequest
@@ -516,3 +517,89 @@ def test_a_range_is_repeated_on_every_page(cql, ordered_table, vector_store_mock
     assert len(requests) == 2
     assert requests[0].max_sort_value is not None
     assert requests[0].max_sort_value == requests[1].max_sort_value
+
+
+# --- short pages from the index node ---------------------------------------------
+#
+# A request to the index node has a budget. When it ends, the node returns the rows it has
+# settled -- fewer than asked for, or none -- and a cursor to go on from.
+
+
+def test_a_page_the_index_node_cut_short_is_topped_up_from_its_cursor(cql, ordered_table, vector_store_mock):
+    """The client's page is filled over as many requests as it takes: each from the cursor of the
+    one before, asking for what the page still lacks. An empty reply with a cursor is one of them."""
+    table, _ = ordered_table
+    vector_store_mock.set_like_responses([
+        (200, like_response([4], next_cursor="a")),
+        (200, like_response([], next_cursor="b")),
+        (200, like_response([3, 2], next_cursor="c")),
+        (200, like_response([1, 0])),
+    ])
+
+    statement = SimpleStatement(
+        f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC", fetch_size=3)
+    result = cql.execute(statement)
+    assert [row.id for row in result.current_rows] == [4, 3, 2]
+    assert result.has_more_pages
+    requests = vector_store_mock.like_requests
+    assert [request.cursor for request in requests] == [None, "a", "b"]
+    assert [request.limit for request in requests] == [3, 2, 2]
+
+    result.fetch_next_page()
+    assert [row.id for row in result.current_rows] == [1, 0]
+    assert not result.has_more_pages
+    assert [request.cursor for request in vector_store_mock.like_requests] == [None, "a", "b", "c"]
+
+
+def test_a_page_that_stays_empty_is_handed_over_with_more_to_come(cql, ordered_table, vector_store_mock):
+    """A keyword with many candidates and no match for a long stretch: reply after reply is empty
+    with a cursor. The page is topped up for half of the statement's timeout, not a fixed few
+    times and not to the timeout's end, and then reaches the client empty, with a paging state:
+    the client asks for the next page, and the scan gets to its end over as many as it takes."""
+    table, _ = ordered_table
+    vector_store_mock.set_like_responses([(200, like_response([], next_cursor="further"))])
+
+    statement = SimpleStatement(
+        f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC USING TIMEOUT 2s",
+        fetch_size=3)
+    started = time.monotonic()
+    result = cql.execute(statement)
+    elapsed = time.monotonic() - started
+    assert result.current_rows == []
+    assert result.has_more_pages
+    assert 0.9 <= elapsed < 2.0, elapsed
+    requests = vector_store_mock.like_requests
+    assert len(requests) > 4
+    assert [request.cursor for request in requests[:3]] == [None, "further", "further"]
+
+
+def test_an_unpaged_query_is_topped_up_until_its_limit_is_met(cql, ordered_table, vector_store_mock):
+    """Its one reply has to hold everything the LIMIT asks for: there is no next page to leave
+    rows to."""
+    table, _ = ordered_table
+    vector_store_mock.set_like_responses([
+        (200, like_response([4], next_cursor="a")),
+        (200, like_response([], next_cursor="b")),
+        (200, like_response([3, 2], next_cursor="c")),
+    ])
+
+    statement = SimpleStatement(
+        f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC LIMIT 3", fetch_size=None)
+    assert [row.id for row in cql.execute(statement)] == [4, 3, 2]
+    requests = vector_store_mock.like_requests
+    assert [request.cursor for request in requests] == [None, "a", "b"]
+    assert [request.limit for request in requests] == [3, 2, 2]
+
+
+def test_an_unpaged_query_the_index_node_cannot_fill_in_time_fails(cql, ordered_table, vector_store_mock):
+    """A short answer would look like a whole one to a client that cannot ask for the rest, so the
+    query fails when its timeout passes."""
+    table, _ = ordered_table
+    vector_store_mock.set_like_responses([(200, like_response([], next_cursor="further"))])
+
+    statement = SimpleStatement(
+        f"SELECT id FROM {table} WHERE nickname LIKE '%ell%' ORDER BY registered_at DESC LIMIT 3 USING TIMEOUT 500ms",
+        fetch_size=None)
+    with pytest.raises(InvalidRequest, match="aborted"):
+        cql.execute(statement)
+    assert len(vector_store_mock.like_requests) > 4

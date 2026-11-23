@@ -85,8 +85,14 @@ read only and replaces `do_execute`:
 - A paged query needs no LIMIT and asks for at most 1000 keys a page; an unpaged one needs a LIMIT of
   at most 1000. The check is made at execution, because only then is it known whether the query is
   paged.
-- A page left short, by keys the table no longer has, is topped up from the cursor up to three
-  times when paged, until full when not.
+- A page can come back short, or empty, with a cursor: a request to the node has a budget of
+  time, and returns what it has settled when it ends; and a key the table no longer has leaves a
+  page a row short. Such a page is topped up from the cursor. A paged query does so for half of
+  the statement's timeout (`top_up_timeout_share`) and then hands the page to the client as it
+  is, with a paging state: the rows of every round are read before the next is asked for, so the
+  page is ready whenever the topping up stops. An unpaged query is topped up until its LIMIT is
+  met, and fails when the timeout passes first: its client cannot ask for the rest, so a short
+  answer would pass for a whole one.
 
 At `CREATE INDEX` (`pattern_index::check_order`), an index that keeps an order is refused on a table
 whose partitioner is not Murmur3 or whose primary key has a column of a type the index node cannot

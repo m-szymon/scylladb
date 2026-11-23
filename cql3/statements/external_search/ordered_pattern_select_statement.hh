@@ -75,11 +75,15 @@ private:
     /// LIMIT, or nullptr when there is nothing more to read.
     lw_shared_ptr<const service::pager::paging_state> next_page_state(const std::optional<sstring>& cursor, uint64_t left) const;
 
-    /// How many times a paged query's page is topped up from the node's cursor after rows the
-    /// table no longer has left it short, before it is handed to the client as it is. A short page
-    /// is a correct page -- the client asks for the next one -- so this only bounds the work of one
-    /// round trip. An unpaged query is topped up until full.
-    static constexpr unsigned max_top_ups_per_page = 3;
+    /// The part of the statement's timeout a paged query may spend topping a page up from the
+    /// node's cursor before it hands the page to the client as it is: one in this many. The index
+    /// node returns a short page, or an empty one, with a cursor when a request has used its
+    /// budget, and a page is also short by the rows the table no longer has. A short page is a
+    /// correct page -- the client asks for the next one -- so this bounds one round trip, and
+    /// leaves the rest of the timeout to the reads of the rows. The rows of every round are read
+    /// before the next is asked for, so the page is ready whenever the topping up stops. An
+    /// unpaged query is topped up until full, or until the timeout fails it.
+    static constexpr unsigned top_up_timeout_share = 2;
 };
 
 } // namespace cql3::statements

@@ -276,7 +276,10 @@ future<::shared_ptr<cql_transport::messages::result_message>> ordered_pattern_se
         }
     }
 
-    auto timeout = db::timeout_clock::now() + get_timeout(state.get_client_state(), options);
+    const auto started = db::timeout_clock::now();
+    const auto allowed = get_timeout(state.get_client_state(), options);
+    auto timeout = started + allowed;
+    const auto top_up_until = started + allowed / top_up_timeout_share;
     auto aoe = abort_on_expiry(timeout);
 
     const auto pattern = evaluate_pattern(options);
@@ -288,9 +291,9 @@ future<::shared_ptr<cql_transport::messages::result_message>> ordered_pattern_se
     // The rows are read a node page at a time into one result set. The index node returns the keys
     // in the order the ORDER BY asks for, and query_base_table preserves that order on both of its
     // paths, so no values provider and no re-sorting are needed. A page can come back short, when
-    // the index names a row the table no longer has; it is topped up from the node's cursor a
-    // bounded number of times, and past that handed over short, which a paging client takes in
-    // its stride.
+    // the index node's request used its budget or the index names a row the table no longer has;
+    // it is topped up from the node's cursor for a part of the timeout, and past that handed over
+    // short, or empty, which a paging client takes in its stride.
     cql3::selection::result_set_builder builder(*_selection, _query_start_time_point, &options);
     // The bounds are sent with every round, and a JSON value only moves.
     auto copy_of = [](const std::optional<sort_bound>& bound) -> std::optional<sort_bound> {
@@ -301,7 +304,7 @@ future<::shared_ptr<cql_transport::messages::result_message>> ordered_pattern_se
     };
     uint64_t returned = 0;
     std::optional<sstring> next_cursor;
-    for (unsigned round = 0;; ++round) {
+    for (;;) {
         auto page = co_await qp.vector_store_client().like_page(_schema->ks_name(), _index.metadata().name(), _schema, pattern,
                 page_limit - returned, std::move(cursor), _order, copy_of(min_sort_value), copy_of(max_sort_value), aoe.abort_source());
         if (!page.has_value()) {
@@ -333,10 +336,10 @@ future<::shared_ptr<cql_transport::messages::result_message>> ordered_pattern_se
         cursor = page->next_cursor;
         const bool short_page = returned < page_limit && returned < remaining;
         // A paged client resumes a short page from its cursor, so the top-ups there only save it
-        // round trips and are bounded. An unpaged one ignores the cursor, so its one reply has to
+        // round trips and stop in time. An unpaged one ignores the cursor, so its one reply has to
         // hold everything the LIMIT asks for: it is topped up until full or out of candidates.
         const bool paged = options.get_page_size() > 0;
-        if (!cursor || !short_page || (paged && round == max_top_ups_per_page)) {
+        if (!cursor || !short_page || (paged && db::timeout_clock::now() >= top_up_until)) {
             break;
         }
     }
