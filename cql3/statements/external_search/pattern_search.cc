@@ -72,13 +72,13 @@ ordering_fit fit_ordering(const schema& schema, const raw::select_statement::par
         if (orderings.empty()) {
             return {};
         }
-        return {.mismatch = "Pattern search queries on an index without order_by return rows in table order, as a filtered LIKE does, and "
-                            "cannot be ordered: order by columns an index declares in its 'order_by' option"};
+        return {.mismatch = "Pattern search queries on an index without order_by return rows in the index's own order and cannot be "
+                            "ordered: order by columns an index declares in its 'order_by' option"};
     }
     auto declared = declared_order(order);
     if (orderings.empty()) {
         return {.mismatch = seastar::format("Pattern search queries on an index ordered by {} need an ORDER BY on those columns, or the first of "
-                                            "them: without one, a LIKE returns rows in table order, which this index does not keep",
+                                            "them: a LIKE without one is served only by a pattern index without order_by",
                         declared)};
     }
     if (orderings.size() > order.columns.size()) {

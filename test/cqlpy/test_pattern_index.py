@@ -351,7 +351,7 @@ def test_like_rejects_scoring_function(cql, test_keyspace):
 
 
 @pytest.mark.parametrize("clause, message", [
-    ("ORDER BY p", "return rows in table order"),
+    ("ORDER BY p", "return rows in the index's own order and cannot be ordered"),
     ("PER PARTITION LIMIT 1", "do not support per-partition limits"),
     ("GROUP BY p", "cannot be run with aggregation"),
 ], ids=["order_by", "per_partition_limit", "group_by"])
@@ -489,7 +489,7 @@ def test_create_pattern_index_with_all_options(cql, test_keyspace):
     options = {
         'case_sensitive': 'true', 'min_gram': '2', 'max_gram': '5', 'order_by': 'registered_at',
         'segment_rows': '1000', 'rewrite': 'false',
-        'rarest_grams': '4',
+        'rarest_grams': '4', 'partition_order': 'token',
     }
     with new_test_table(cql, test_keyspace, schema) as table:
         index_name = unique_name()
@@ -507,6 +507,7 @@ def test_create_pattern_index_with_all_options(cql, test_keyspace):
     ("segment_rows", "0"), ("segment_rows", "200000"),
     ("rewrite", "true"), ("rewrite", "FALSE"),
     ("rarest_grams", "0"), ("rarest_grams", "4"),
+    ("partition_order", "scattered"), ("partition_order", "token"), ("partition_order", "Token"),
 ])
 def test_create_pattern_index_with_valid_option_value(cql, test_keyspace, option, value):
     """segment_rows takes 0 for no cap, rarest_grams 0 for all grams."""
@@ -530,6 +531,8 @@ def test_create_pattern_index_with_valid_option_value(cql, test_keyspace, option
     ("rarest_grams", "", "must be a number of grams"),
     ("rarest_grams", "1000", "must be a number of grams"),
     ("rewrite", "maybe", "Invalid value in option 'rewrite'"),
+    ("partition_order", "random", "Invalid value in option 'partition_order'"),
+    ("partition_order", "", "Invalid value in option 'partition_order'"),
     ("order_by", "", "expected a column name"),
     ("order_by", "a b", "expected ASC, DESC or a comma"),
     ("order_by", "a, a", "named twice"),

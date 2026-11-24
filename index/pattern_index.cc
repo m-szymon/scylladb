@@ -31,6 +31,10 @@ const sstring order_by_option = "order_by";
 const sstring segment_rows_option = "segment_rows";
 const sstring rewrite_option = "rewrite";
 const sstring rarest_grams_option = "rarest_grams";
+const sstring partition_order_option = "partition_order";
+
+/// The orders of partitions an index node can keep: by a fixed scramble of the token, or by token.
+const std::vector<sstring> partition_order_values = {"scattered", "token"};
 
 /// Whether `value` equals `expected`, ignoring letter case: the enumerated options are validated
 /// that way, so they have to be read that way too.
@@ -84,6 +88,11 @@ const std::unordered_map<sstring, std::function<void(std::string_view, const sst
         // verification drops what the others would have. 4 by default, 0 for all of them. Read by
         // the index node only.
         {rarest_grams_option, validate_gram_count_option},
+        // The order of partitions wherever the ordering columns do not decide it. 'scattered' (the
+        // default) spreads the first rows of a search over the token ring, and with them the reads
+        // of their rows over the replicas; 'token' is the order of a scan, whose first rows are all
+        // in the first tablet. Read by the index node only.
+        {partition_order_option, std::bind_front(util::validate_enumerated_option, partition_order_values)},
 };
 
 /// Reads an already validated positive integer option, or the default when absent.

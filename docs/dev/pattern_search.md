@@ -58,7 +58,14 @@ column and stating these rules.
 
 A pattern index is in one of two orders, read from its `order_by` option by
 `pattern_index::order_of` (the option's syntax is `parse_order`, which the index node repeats):
-table order (no option), or the declared columns then table order.
+table order (no option), or the declared columns then table order. "Table order" here is the
+index's own: partition after partition, each one's rows in clustering order, with the partitions
+by token (`'partition_order': 'token'`, the order of a scan) or by a fixed scramble of the token
+(`'scattered'`, the default). The option is read by the index node only; ScyllaDB validates its
+value and never depends on which it is, since it returns the node's keys in the node's order.
+The default is the scramble because of where the rows are read from: in token order the first
+page of every frequent pattern is the lowest tokens, one tablet, and its replicas' shards read
+the rows of every such page (AWS run 0818814c: one shard at 100%, the node at 49%).
 `pattern_search::index_for` picks, among the pattern indexes on the `LIKE`'s column, one whose
 order fits the query (`fit_ordering`): a query without `ORDER BY` wants table order; one with
 `ORDER BY` wants an index ordered by those columns, a prefix of them, all as declared or all

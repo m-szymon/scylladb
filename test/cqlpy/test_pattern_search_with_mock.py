@@ -223,5 +223,5 @@ def test_an_index_without_order_by_pages_in_the_order_the_node_keeps(cql, table_
 
 def test_an_index_without_order_by_cannot_be_ordered(cql, table_order_table):
     table, _ = table_order_table
-    with pytest.raises(InvalidRequest, match="return rows in table order"):
+    with pytest.raises(InvalidRequest, match="return rows in the index's own order"):
         cql.execute(f"SELECT id FROM {table} WHERE title LIKE '%ell%' ORDER BY id DESC LIMIT {NUM_ROWS}")

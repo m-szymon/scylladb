@@ -50,8 +50,9 @@ public:
 
     /// What an index answers in: its `order_by` option.
     struct order {
-        /// No `order_by`: table order, the order a scan returns, which is what a filtered LIKE
-        /// returns. Otherwise the declared columns, then table order.
+        /// No `order_by`: the index's table order -- partition after partition, each one's rows in
+        /// clustering order, the partitions as the index's `partition_order` says (by token, the
+        /// order a scan returns, only when asked for). Otherwise the declared columns, then that.
         enum class kind { table, columns };
         struct column {
             sstring name;

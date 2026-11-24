@@ -132,9 +132,8 @@ column from the index, even with ``ALLOW FILTERING``. The full rules are in
 Indexed vs. Filtered LIKE
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The indexed column of the table below describes an index without ``order_by``,
-which keeps table order. One with ``order_by`` columns is ordered by them; see
-`Ordering and Paging`_.
+The indexed column of the table below describes an index without ``order_by``.
+One with ``order_by`` columns is ordered by them; see `Ordering and Paging`_.
 
 Without a pattern index, ``LIKE`` is a filter: ScyllaDB reads the rows and
 checks each value against the pattern, as described in
@@ -168,8 +167,10 @@ filtered one as follows:
 +----------------------+------------------------------------------+------------------------------------------------------+
 | Paging               | Paged like any other query.              | Paged like any other query.                          |
 +----------------------+------------------------------------------+------------------------------------------------------+
-| Order                | The order of a scan: by token, then by   | The same, and ``LIMIT n`` returns the first ``n``    |
-|                      | clustering key.                          | rows of it.                                          |
+| Order                | The order of a scan: by token, then by   | Partitions in a fixed order unrelated to the token,  |
+|                      | clustering key.                          | each one's rows together and by clustering key; the  |
+|                      |                                          | order of a scan with ``'partition_order': 'token'``. |
+|                      |                                          | ``LIMIT n`` returns the first ``n`` rows of it.      |
 +----------------------+------------------------------------------+------------------------------------------------------+
 | Consistency          | The rows are read, and matched, at the   | Eventually consistent, and the rows are not checked  |
 |                      | query's consistency level.               | against the pattern again: shortly after a write, a  |
@@ -183,8 +184,16 @@ filtered one as follows:
 Ordering and Paging
 -------------------
 
-A ``LIKE`` without ``ORDER BY`` returns its rows in table order, as a filtered
-``LIKE`` does, and that is the order an index without ``order_by`` keeps. A
+A ``LIKE`` without ``ORDER BY`` returns its rows in the order an index without
+``order_by`` keeps: partition after partition, each one's rows together and in
+clustering order. The order of the partitions is fixed, so the query can be
+paged, but by default it is not the order of a scan: it is unrelated to the
+token (``'partition_order': 'scattered'``), so that the rows of a page come
+from all over the token ring and reading them loads every replica alike. In
+the order of a scan the first page of every frequent pattern would be read
+from the replicas of the first tablet. An index created with
+``'partition_order': 'token'`` keeps the order of a scan, as a filtered
+``LIKE`` returns it. A
 search box that shows the newest matches first, a page at a time, needs an
 index ordered by another column. The ``order_by`` option declares up to four
 columns, each optionally ``ASC`` (the default) or ``DESC``; each must be an
@@ -201,14 +210,14 @@ integer, ``date``, ``time`` or ``timestamp`` column::
         WHERE nickname LIKE '%将军%' AND registered_at < '2026-01-01'
         ORDER BY registered_at DESC;
 
-* The index keeps its rows by the declared columns, then in table order. It
+* The index keeps its rows by the declared columns, then in the order of its
+  partitions (``partition_order``) and by clustering key. It
   serves a query that orders by a prefix of those columns, all in their
   declared directions or all reversed, as a table serves ordering by its
   clustering columns. With ``'order_by': 'a DESC, b'``, ``ORDER BY a DESC``,
   ``ORDER BY a DESC, b ASC`` and ``ORDER BY a ASC, b DESC`` are served, and
   ``ORDER BY a DESC, b DESC`` is rejected.
-* A ``LIKE`` without ``ORDER BY`` is not served by such an index, since it does
-  not keep table order; it is rejected, unless another pattern index on the
+* A ``LIKE`` without ``ORDER BY`` is not served by such an index; it is rejected, unless another pattern index on the
   column serves it. Several pattern indexes on one column are allowed, and each
   query uses the one whose order fits it.
 * A range on the first ordering column (``<``, ``<=``, ``>``, ``>=``) narrows

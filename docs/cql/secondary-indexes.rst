@@ -457,45 +457,53 @@ Example::
 
 The following options are supported for pattern indexes:
 
-+-------------------------+----------------------------------------------------------------------------------+------------+
-| Option                  | Description                                                                      | Default    |
-+=========================+==================================================================================+============+
-| ``case_sensitive``      | Whether matching distinguishes letter case, as ``LIKE`` does. With ``false``     | ``true``   |
-|                         | both the indexed values and the patterns are lowercased, so ``'%ab-%'`` matches  |            |
-|                         | ``AB-1024-XL``. Supported values: ``true``, ``false``, in any letter case.       |            |
-+-------------------------+----------------------------------------------------------------------------------+------------+
-| ``min_gram``            | The length in characters of the shortest substring the index node indexes. A     | ``1``      |
-|                         | pattern whose runs of literal characters are all shorter is refused. A positive  |            |
-|                         | integer up to 8.                                                                 |            |
-+-------------------------+----------------------------------------------------------------------------------+------------+
-| ``max_gram``            | The length in characters of the longest indexed substring. A literal part up to  | ``3``      |
-|                         | this length is a single exact lookup; a longer one is answered from its          |            |
-|                         | substrings and checked. A positive integer up to 8, not smaller than             |            |
-|                         | ``min_gram``.                                                                    |            |
-+-------------------------+----------------------------------------------------------------------------------+------------+
-| ``order_by``            | What the index answers in. Absent: table order, the order of a scan, which is    | none       |
-|                         | what a filtered ``LIKE`` returns; the search is paged. Up to 4 columns, each     |            |
-|                         | optionally ``ASC`` or ``DESC`` (``'published_at DESC, score'``): the rows are    |            |
-|                         | ordered by them, then in table order, and the index serves queries that          |            |
-|                         | ``ORDER BY`` a prefix of them. Each must be an integer, ``date``, ``time`` or    |            |
-|                         | ``timestamp`` column, regular or part of the primary key; rows where one is      |            |
-|                         | null are not in the index. Column names follow CQL's rules: unquoted ones are    |            |
-|                         | case-insensitive, double-quoted ones are kept as written. See                    |            |
-|                         | :ref:`Pattern search queries <pattern-queries>`.                                 |            |
-+-------------------------+----------------------------------------------------------------------------------+------------+
-| ``segment_rows``        | The most rows the index node keeps in one internal segment, which keeps segments | ``200000`` |
-|                         | narrow along the index's order so that a later page costs what the first one     |            |
-|                         | does. ``0`` turns the cap off.                                                   |            |
-+-------------------------+----------------------------------------------------------------------------------+------------+
-| ``rewrite``             | Whether the index node rewrites segments that span much more of the ordered      | ``true``   |
-|                         | column than their share of the rows, as an index created on an already loaded    |            |
-|                         | table has. Supported values: ``true``, ``false``. The default applies wherever   |            |
-|                         | there is a segment cap.                                                          |            |
-+-------------------------+----------------------------------------------------------------------------------+------------+
-| ``rarest_grams``        | How many substrings of a literal part longer than ``max_gram`` the index node    | ``4``      |
-|                         | intersects, those in the fewest rows first; the check drops what the others      |            |
-|                         | would have. ``0`` intersects all of them.                                        |            |
-+-------------------------+----------------------------------------------------------------------------------+------------+
++-------------------------+----------------------------------------------------------------------------------+---------------+
+| Option                  | Description                                                                      | Default       |
++=========================+==================================================================================+===============+
+| ``case_sensitive``      | Whether matching distinguishes letter case, as ``LIKE`` does. With ``false``     | ``true``      |
+|                         | both the indexed values and the patterns are lowercased, so ``'%ab-%'`` matches  |               |
+|                         | ``AB-1024-XL``. Supported values: ``true``, ``false``, in any letter case.       |               |
++-------------------------+----------------------------------------------------------------------------------+---------------+
+| ``min_gram``            | The length in characters of the shortest substring the index node indexes. A     | ``1``         |
+|                         | pattern whose runs of literal characters are all shorter is refused. A positive  |               |
+|                         | integer up to 8.                                                                 |               |
++-------------------------+----------------------------------------------------------------------------------+---------------+
+| ``max_gram``            | The length in characters of the longest indexed substring. A literal part up to  | ``3``         |
+|                         | this length is a single exact lookup; a longer one is answered from its          |               |
+|                         | substrings and checked. A positive integer up to 8, not smaller than             |               |
+|                         | ``min_gram``.                                                                    |               |
++-------------------------+----------------------------------------------------------------------------------+---------------+
+| ``order_by``            | What the index answers in. Absent: the order of its partitions (see              | none          |
+|                         | ``partition_order``), each partition's rows together and in clustering order;    |               |
+|                         | the search is paged. Up to 4 columns, each                                       |               |
+|                         | optionally ``ASC`` or ``DESC`` (``'published_at DESC, score'``): the rows are    |               |
+|                         | ordered by them, then in that order, and the index serves queries that           |               |
+|                         | ``ORDER BY`` a prefix of them. Each must be an integer, ``date``, ``time`` or    |               |
+|                         | ``timestamp`` column, regular or part of the primary key; rows where one is      |               |
+|                         | null are not in the index. Column names follow CQL's rules: unquoted ones are    |               |
+|                         | case-insensitive, double-quoted ones are kept as written. See                    |               |
+|                         | :ref:`Pattern search queries <pattern-queries>`.                                 |               |
++-------------------------+----------------------------------------------------------------------------------+---------------+
+| ``segment_rows``        | The most rows the index node keeps in one internal segment, which keeps segments | ``200000``    |
+|                         | narrow along the index's order so that a later page costs what the first one     |               |
+|                         | does. ``0`` turns the cap off.                                                   |               |
++-------------------------+----------------------------------------------------------------------------------+---------------+
+| ``rewrite``             | Whether the index node rewrites segments that span much more of the ordered      | ``true``      |
+|                         | column than their share of the rows, as an index created on an already loaded    |               |
+|                         | table has. Supported values: ``true``, ``false``. The default applies wherever   |               |
+|                         | there is a segment cap.                                                          |               |
++-------------------------+----------------------------------------------------------------------------------+---------------+
+| ``rarest_grams``        | How many substrings of a literal part longer than ``max_gram`` the index node    | ``4``         |
+|                         | intersects, those in the fewest rows first; the check drops what the others      |               |
+|                         | would have. ``0`` intersects all of them.                                        |               |
++-------------------------+----------------------------------------------------------------------------------+---------------+
+| ``partition_order``     | The order of partitions wherever ``order_by`` does not decide it. ``scattered``: | ``scattered`` |
+|                         | a fixed order unrelated to the token, so the rows of a page come from all over   |               |
+|                         | the token ring and reading them loads every replica alike. ``token``: the order  |               |
+|                         | of a scan, which is what a filtered ``LIKE`` returns; the first page of every    |               |
+|                         | frequent pattern is then read from the first tablet's replicas. Either way the   |               |
+|                         | rows of a partition come together, in clustering order, and paging is exact.     |               |
++-------------------------+----------------------------------------------------------------------------------+---------------+
 
 .. _drop-index-statement:
 

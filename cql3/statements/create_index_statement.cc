@@ -831,14 +831,15 @@ create_index_statement::build_index_schema(data_dictionary::database db, locator
                 "Every LIKE on column {} will be served by a pattern index instead of by filtering, even with ALLOW FILTERING. "
                 "This one serves a LIKE ordered by {} (or the first of them), all as declared or all reversed; such a query may "
                 "restrict only the LIKE and a range on {}, and needs a LIMIT of at most {} unless it is paged, otherwise it fails. "
-                "A LIKE without ORDER BY returns rows in table order, which this index does not keep, so it fails unless another "
-                "pattern index on the column serves it. Results are eventually consistent. Dropping the index restores filtered LIKE.",
+                "A LIKE without ORDER BY is served only by a pattern index without order_by, so it fails unless the column has "
+                "one. Results are eventually consistent. Dropping the index restores filtered LIKE.",
                 targets[0]->column_name(), columns, order.columns.front().name, external_index_select_statement::max_query_limit));
         } else {
             warnings.emplace_back(format(
                 "Every LIKE on column {} will be served by this pattern index instead of by filtering, even with ALLOW FILTERING. "
                 "Such a query must have the LIKE as its only restriction, cannot be ordered, and needs a LIMIT of at most {} unless "
-                "it is paged, otherwise it fails. It returns its rows in table order, as a filtered LIKE does, and is eventually "
+                "it is paged, otherwise it fails. It returns its rows in the index's own order, which is fixed but is the order a "
+                "filtered LIKE returns only if the index is created with 'partition_order': 'token', and is eventually "
                 "consistent. Dropping the index restores filtered LIKE.",
                 targets[0]->column_name(), external_index_select_statement::max_query_limit));
         }
